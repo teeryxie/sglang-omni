@@ -356,8 +356,6 @@ def load_socialomni_level1_samples(
         if not isinstance(raw_options, list) or len(raw_options) != 4:
             raise ValueError(f"{description} must contain exactly four options")
         options = [_strip_option_prefix(str(option)) for option in raw_options]
-        if any(not option for option in options):
-            raise ValueError(f"{description} contains an empty option")
 
         answer = _require_text(row, "correct_answer", description).upper()
         if answer not in {"A", "B", "C", "D"}:

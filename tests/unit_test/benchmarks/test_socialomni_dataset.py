@@ -77,6 +77,22 @@ def test_level1_preserves_nested_paths_and_builds_paper_fields(tmp_path: Path) -
     assert "judge-only reference" not in sample.prompt
 
 
+def test_level1_preserves_a_labeled_blank_option(tmp_path: Path) -> None:
+    video = tmp_path / "data/level_1/videos/video.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    row = _level1_row(738, "video.mp4", "consistent")
+    row["options"] = ["A. First", "B. ", "C. Third", "D. Fourth"]
+    row["correct_answer"] = "B"
+    _write_json(tmp_path / "data/level_1/dataset.json", [row])
+
+    sample = load_socialomni_level1_samples(tmp_path)[0]
+
+    assert sample.options == ["First", "", "Third", "Fourth"]
+    assert "\nB. \n" in sample.prompt
+    assert sample.answer == "B"
+
+
 def test_level1_mini_is_deterministic_and_covers_both_visibility_groups(
     tmp_path: Path,
 ) -> None:
