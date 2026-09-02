@@ -266,6 +266,7 @@ def test_judge_config_records_env_name_not_secret(tmp_path: Path, monkeypatch) -
                         "model": name,
                         "base_url": f"https://{name}.example/v1",
                         "api_key_env": "SOCIALOMNI_TEST_KEY",
+                        "max_tokens": 512 if name == "gemini-2.5-pro" else 8,
                     }
                     for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
                 ]
@@ -274,10 +275,65 @@ def test_judge_config_records_env_name_not_secret(tmp_path: Path, monkeypatch) -
         encoding="utf-8",
     )
 
-    serialized = json.dumps([spec.public_dict() for spec in load_judge_config(path)])
+    specs = load_judge_config(path)
+    serialized = json.dumps([spec.public_dict() for spec in specs])
 
     assert "SOCIALOMNI_TEST_KEY" in serialized
     assert "top-secret" not in serialized
+    assert [spec.max_tokens for spec in specs] == [8, 512, 8]
+
+
+def test_judge_phase_uses_per_judge_token_budget(monkeypatch, tmp_path: Path) -> None:
+    observed: dict[str, int] = {}
+
+    async def fake_request(*_args, **kwargs) -> ChatResult:
+        observed[kwargs["payload"]["model"]] = kwargs["payload"]["max_tokens"]
+        return ChatResult(
+            request_id=kwargs["request_id"],
+            text="75",
+            is_success=True,
+            latency_s=0.001,
+        )
+
+    monkeypatch.setattr(socialomni_tasks, "request_chat_completion", fake_request)
+    sample = _level2(tmp_path / "video.mp4")
+    judges = [
+        JudgeSpec(
+            name=name,
+            model=name,
+            base_url="http://example",
+            max_tokens=max_tokens,
+        )
+        for name, max_tokens in (
+            ("gpt-4o", 8),
+            ("gemini-2.5-pro", 512),
+            ("qwen3-omni", 16),
+        )
+    ]
+
+    asyncio.run(
+        run_level2_judge_phase(
+            {sample.sample_id: sample},
+            [
+                {
+                    "sample_id": sample.sample_id,
+                    "gold_when": "YES",
+                    "gold_response": "candidate",
+                    "prefix_path": sample.video_path,
+                }
+            ],
+            judges=judges,
+            max_concurrency=3,
+            max_attempts=1,
+            timeout_s=1,
+        )
+    )
+
+    assert observed == {
+        "gpt-4o": 8,
+        "gemini-2.5-pro": 512,
+        "qwen3-omni": 16,
+    }
 
 
 def test_judge_payload_only_sends_server_path_when_explicit() -> None:

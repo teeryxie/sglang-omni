@@ -284,10 +284,17 @@ def _contract(
     }
 
 
-async def _preflight(config: SocialOmniEvalConfig, judges: list[JudgeSpec]) -> None:
+async def _preflight_main(config: SocialOmniEvalConfig) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
     async with aiohttp.ClientSession(timeout=timeout) as session:
         await preflight_endpoint(session, base_url=config.base_url, model=config.model)
+
+
+async def _preflight_judges(
+    config: SocialOmniEvalConfig, judges: list[JudgeSpec]
+) -> None:
+    timeout = aiohttp.ClientTimeout(total=config.timeout_s)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
         for judge in judges:
             await preflight_endpoint(
                 session,
@@ -295,6 +302,7 @@ async def _preflight(config: SocialOmniEvalConfig, judges: list[JudgeSpec]) -> N
                 model=judge.model,
                 api_key_env=judge.api_key_env,
                 judge_score=True,
+                max_tokens=judge.max_tokens,
             )
 
 
@@ -346,6 +354,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             base_url=judge.base_url,
             api_key_env=judge.api_key_env,
             max_concurrency=min(judge.max_concurrency, config.judge_max_concurrency),
+            max_tokens=judge.max_tokens,
             model_family=judge.model_family,
             video_input=judge.video_input,
         )
@@ -381,7 +390,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     artifacts.prepare(contract, provenance, resume=config.resume)
 
     try:
-        await _preflight(config, judges)
+        await _preflight_main(config)
         summary: dict[str, Any] = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
@@ -475,6 +484,8 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 and str(record.get("gold_response", "")).strip()
                 and str(record["sample_id"]) not in reusable_judges
             ]
+            if judge_pending:
+                await _preflight_judges(config, judges)
             judge_phase_started = time.perf_counter()
             fresh_judges = await run_level2_judge_phase(
                 {sample.sample_id: sample for sample in level2_samples},

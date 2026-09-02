@@ -37,6 +37,7 @@ class JudgeSpec:
     base_url: str
     api_key_env: str | None = None
     max_concurrency: int = 1
+    max_tokens: int = 8
     model_family: str | None = None
     video_input: str = "none"
 
@@ -84,6 +85,7 @@ def load_judge_config(path: str | Path) -> list[JudgeSpec]:
         "base_url",
         "api_key_env",
         "max_concurrency",
+        "max_tokens",
         "model_family",
         "video_input",
     }
@@ -100,6 +102,9 @@ def load_judge_config(path: str | Path) -> list[JudgeSpec]:
         concurrency = row.get("max_concurrency", 1)
         if not isinstance(concurrency, int) or concurrency < 1:
             raise ValueError(f"judges[{index}].max_concurrency must be >= 1")
+        max_tokens = row.get("max_tokens", 8)
+        if not isinstance(max_tokens, int) or max_tokens < 1:
+            raise ValueError(f"judges[{index}].max_tokens must be >= 1")
         video_input = row.get("video_input", "none")
         if video_input not in {"none", "server-path"}:
             raise ValueError(
@@ -112,6 +117,7 @@ def load_judge_config(path: str | Path) -> list[JudgeSpec]:
                 base_url=row["base_url"].strip().rstrip("/"),
                 api_key_env=(row.get("api_key_env") or None),
                 max_concurrency=concurrency,
+                max_tokens=max_tokens,
                 model_family=(row.get("model_family") or None),
                 video_input=video_input,
             )
@@ -239,6 +245,7 @@ async def preflight_endpoint(
     model: str,
     api_key_env: str | None = None,
     judge_score: bool = False,
+    max_tokens: int = 4,
 ) -> None:
     result = await request_chat_completion(
         session,
@@ -256,7 +263,7 @@ async def preflight_endpoint(
                 }
             ],
             "modalities": ["text"],
-            "max_tokens": 4,
+            "max_tokens": max_tokens,
             "temperature": 0.0,
             "stream": False,
         },
@@ -699,7 +706,7 @@ async def run_level2_judge_phase(
                 judge,
                 build_judge_prompt(sample, str(record["gold_response"])),
                 str(record["prefix_path"]),
-                max_tokens=8,
+                max_tokens=judge.max_tokens,
             )
             last_result: ChatResult | None = None
             for parse_attempt in range(1, max_attempts + 1):

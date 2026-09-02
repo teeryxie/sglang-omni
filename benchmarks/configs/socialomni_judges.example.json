@@ -6,6 +6,7 @@
       "base_url": "https://openai-compatible.example/v1",
       "api_key_env": "SOCIALOMNI_GPT4O_API_KEY",
       "max_concurrency": 4,
+      "max_tokens": 8,
       "model_family": "openai",
       "video_input": "none"
     },
@@ -15,6 +16,7 @@
       "base_url": "https://openai-compatible.example/v1",
       "api_key_env": "SOCIALOMNI_GEMINI_API_KEY",
       "max_concurrency": 4,
+      "max_tokens": 512,
       "model_family": "google",
       "video_input": "none"
     },
@@ -24,6 +26,7 @@
       "base_url": "http://localhost:8000/v1",
       "api_key_env": null,
       "max_concurrency": 1,
+      "max_tokens": 8,
       "model_family": "qwen",
       "video_input": "server-path"
     }

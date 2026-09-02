@@ -223,7 +223,8 @@ python -m benchmarks.dataset.prepare \
 The judge configuration must contain exactly the fixed names `gpt-4o`,
 `gemini-2.5-pro`, and `qwen3-omni`. Each entry names an OpenAI-compatible
 endpoint, the environment variable holding its API key, and its own concurrency
-limit. `video_input: none` sends the reference transcript, reference
+limit. It can also set a per-judge `max_tokens`; this matters for endpoints that
+count hidden reasoning tokens against the completion budget. `video_input: none` sends the reference transcript, reference
 continuation, and candidate as text without leaking a host-local path to a
 remote endpoint. `video_input: server-path` also sends the cached prefix and is
 valid only when that endpoint reads the same filesystem. The manifest records
