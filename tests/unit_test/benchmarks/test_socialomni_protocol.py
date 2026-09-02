@@ -36,6 +36,7 @@ from benchmarks.tasks.socialomni import (
     parse_judge_score,
     parse_when,
     request_chat_completion,
+    resolve_ffmpeg_executable,
     run_level2_judge_phase,
 )
 from benchmarks.tasks.video_understanding import make_video_send_fn
@@ -607,6 +608,22 @@ def test_ffmpeg_command_reencodes_instead_of_stream_copy(tmp_path: Path) -> None
     assert command[command.index("-c:v") + 1] == "libx264"
     assert command[command.index("-c:a") + 1] == "aac"
     assert command[command.index("-t") + 1] == "1.250000"
+
+
+def test_ffmpeg_resolver_falls_back_to_project_binary(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bundled = tmp_path / "ffmpeg"
+    bundled.write_text("binary")
+    bundled.chmod(0o755)
+    monkeypatch.setattr(socialomni_tasks.shutil, "which", lambda _name: None)
+    monkeypatch.setattr(
+        socialomni_tasks.imageio_ffmpeg,
+        "get_ffmpeg_exe",
+        lambda: str(bundled),
+    )
+
+    assert resolve_ffmpeg_executable() == str(bundled)
 
 
 @pytest.mark.skipif(

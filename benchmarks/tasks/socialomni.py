@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 import aiohttp
+import imageio_ffmpeg
 
 from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLevel2Sample
 
@@ -444,6 +445,18 @@ def build_ffmpeg_prefix_command(
     ]
 
 
+def resolve_ffmpeg_executable() -> str | None:
+    """Resolve system ffmpeg or the binary supplied by imageio-ffmpeg."""
+
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    bundled_ffmpeg = Path(imageio_ffmpeg.get_ffmpeg_exe())
+    if bundled_ffmpeg.is_file() and os.access(bundled_ffmpeg, os.X_OK):
+        return str(bundled_ffmpeg)
+    return None
+
+
 async def create_video_prefix(
     input_path: str | Path,
     timestamp_s: float,
@@ -452,7 +465,7 @@ async def create_video_prefix(
     """Re-encode a query-time-bounded prefix and atomically populate its cache."""
     if not math.isfinite(timestamp_s) or timestamp_s <= 0:
         raise ValueError("timestamp_s must be finite and positive")
-    ffmpeg = shutil.which("ffmpeg")
+    ffmpeg = resolve_ffmpeg_executable()
     if not ffmpeg:
         raise RuntimeError("ffmpeg is required for SocialOmni Level 2")
     source = Path(input_path).resolve()
