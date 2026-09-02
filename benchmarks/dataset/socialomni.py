@@ -531,6 +531,15 @@ def load_socialomni_level2_samples(
             description=description,
         )
         metadata = _require_object(row.get("metadata"), f"{description} metadata")
+        gold_when = _normalize_gold_when(
+            question_when_data, f"{description} question_1"
+        )
+        reference_response = str(question_how_data.get("answer") or "").strip()
+        if gold_when == "YES" and not reference_response:
+            raise ValueError(
+                f"{description} question_2 has no non-empty 'answer' for a "
+                "gold-positive item"
+            )
         samples.append(
             SocialOmniLevel2Sample(
                 sample_id=sample_id,
@@ -540,12 +549,8 @@ def load_socialomni_level2_samples(
                 ),
                 timestamp=timestamp,
                 timestamp_s=parse_socialomni_timestamp(timestamp),
-                gold_when=_normalize_gold_when(
-                    question_when_data, f"{description} question_1"
-                ),
-                reference_response=_require_text(
-                    question_how_data, "answer", f"{description} question_2"
-                ),
+                gold_when=gold_when,
+                reference_response=reference_response,
                 reference_context=_require_text(row, "full_asr", description),
                 question_when=question_when,
                 question_how=question_how,

@@ -230,6 +230,32 @@ def test_level2_fields_and_deterministic_mini(tmp_path: Path) -> None:
     assert samples[0].reference_context == "reference context 1"
 
 
+def test_level2_allows_blank_reference_only_for_gold_negative(tmp_path: Path) -> None:
+    videos = tmp_path / "data/level_2/videos"
+    videos.mkdir(parents=True)
+    for filename in ("no.mp4", "yes.mp4"):
+        (videos / filename).write_bytes(b"video")
+    no_row = _level2_row(1, "no.mp4", "B")
+    no_row["question_2"]["answer"] = ""  # type: ignore[index]
+    yes_row = _level2_row(2, "yes.mp4", "A")
+    yes_row["question_2"]["answer"] = ""  # type: ignore[index]
+    _write_json(
+        tmp_path / "data/level_2/annotations.json",
+        {"total_samples": 1, "data": [no_row]},
+    )
+
+    sample = load_socialomni_level2_samples(tmp_path)[0]
+    assert sample.gold_when == "NO"
+    assert sample.reference_response == ""
+
+    _write_json(
+        tmp_path / "data/level_2/annotations.json",
+        {"total_samples": 1, "data": [yes_row]},
+    )
+    with pytest.raises(ValueError, match="gold-positive"):
+        load_socialomni_level2_samples(tmp_path)
+
+
 @pytest.mark.parametrize(
     ("raw", "expected"),
     [("27", 27.0), ("1:02", 62.0), ("00:17:50", 17.5), (3.25, 3.25)],
