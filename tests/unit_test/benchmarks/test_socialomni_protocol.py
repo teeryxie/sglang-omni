@@ -15,10 +15,7 @@ from benchmarks.dataset.socialomni import (
     SocialOmniLevel1Sample,
     SocialOmniLevel2Sample,
 )
-from benchmarks.eval.benchmark_omni_socialomni import (
-    RunArtifacts,
-    SocialOmniEvalConfig,
-)
+from benchmarks.eval.benchmark_omni_socialomni import RunArtifacts, SocialOmniEvalConfig
 from benchmarks.tasks.socialomni import (
     ChatResult,
     JudgeSpec,
