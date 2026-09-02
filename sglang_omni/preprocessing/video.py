@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import av
-import librosa
+import numpy as np
 import torch
 from qwen_vl_utils import vision_process as qwen_vision
 from torchvision.transforms import InterpolationMode
@@ -290,14 +290,36 @@ async def ensure_video_list_async(
 
 def _extract_audio_from_path(video_path: Path, target_sr: int) -> Any | None:
     """Extract audio from a video file path."""
-    if not _check_if_video_has_audio(video_path):
-        return None
     try:
-        audio, _ = librosa.load(str(video_path), sr=target_sr)
-        return audio
-    except Exception as e:
-        logger.debug(f"Failed to extract audio from {video_path}: {e}")
-        return None
+        with av.open(str(video_path)) as container:
+            audio_stream = next(
+                (stream for stream in container.streams if stream.type == "audio"),
+                None,
+            )
+            if audio_stream is None:
+                return None
+
+            resampler = av.AudioResampler(
+                format="fltp",
+                layout="mono",
+                rate=target_sr,
+            )
+            chunks: list[np.ndarray] = []
+            for frame in container.decode(audio=0):
+                for resampled in resampler.resample(frame):
+                    chunks.append(resampled.to_ndarray().reshape(-1))
+            for resampled in resampler.resample(None):
+                chunks.append(resampled.to_ndarray().reshape(-1))
+
+        if not chunks:
+            raise VideoDecodeError(f"Audio stream in {video_path} decoded no samples")
+        return np.concatenate(chunks).astype(np.float32, copy=False)
+    except VideoDecodeError:
+        raise
+    except Exception as exc:
+        raise VideoDecodeError(
+            f"Failed to extract embedded audio from {video_path}: {exc}"
+        ) from exc
 
 
 def load_video_path(
