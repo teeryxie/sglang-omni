@@ -10,6 +10,10 @@ import pytest
 from benchmarks.dataset import prepare
 from benchmarks.dataset.socialomni import (
     SOCIALOMNI_DATASET_REVISION,
+    SOCIALOMNI_JFS_SNAPSHOT,
+    SOCIALOMNI_LEVEL1_SHA256,
+    SOCIALOMNI_LEVEL2_SHA256,
+    SocialOmniDatasetInfo,
     inspect_socialomni_dataset,
     load_socialomni_level1_samples,
     load_socialomni_level2_samples,
@@ -301,6 +305,27 @@ def test_inspection_includes_snapshot_manifest_in_dataset_identity(
 
     assert first.level1_sha256 == second.level1_sha256
     assert first.dataset_sha256 != second.dataset_sha256
+
+
+@pytest.mark.parametrize(
+    "version", [SOCIALOMNI_DATASET_REVISION, SOCIALOMNI_JFS_SNAPSHOT]
+)
+def test_paper_snapshot_accepts_public_and_jfs_identities(version: str) -> None:
+    info = SocialOmniDatasetInfo(
+        root="/dataset",
+        version=version,
+        level1_file="dataset.json",
+        level1_sha256=SOCIALOMNI_LEVEL1_SHA256,
+        level2_file="annotations.json",
+        level2_sha256=SOCIALOMNI_LEVEL2_SHA256,
+        manifest_file=None,
+        manifest_sha256=None,
+    )
+
+    assert info.is_paper_snapshot
+    assert not SocialOmniDatasetInfo(
+        **{**info.__dict__, "level2_sha256": "different"}
+    ).is_paper_snapshot
 
 
 def test_prepare_socialomni_uses_pinned_snapshot_revision(

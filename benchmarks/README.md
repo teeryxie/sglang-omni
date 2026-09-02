@@ -211,9 +211,11 @@ Neither model prompt receives the reference transcript or continuation.
 
 The public dataset downloader pins Hugging Face revision
 `3b76009b45090eaa54007454c93a831f3cc8e1e6` and writes the revision into the
-materialized directory. The company JFS snapshot directory
+materialized directory. The company JuiceFS (JFS) snapshot directory
 `7e88c7e1afed65eb6fda17aac76bebbe2da57ec7` is a separate internal identifier,
-not a public Hugging Face revision.
+not a public Hugging Face revision. Their Level 1 and Level 2 metadata SHA-256
+content digests (cryptographic file fingerprints) are identical; formal results
+require one of these two identities and the exact pinned metadata digests.
 
 ```bash
 python -m benchmarks.dataset.prepare \
@@ -271,9 +273,13 @@ Each run writes `manifest.json`, `per_request.jsonl`, `judge_scores.jsonl`,
 `<output-dir>/<git-commit>/<run-id>/`. `--resume` requires the same `--run-id`
 and reuses only successful stages whose manifest fingerprint exactly matches
 the code, data identity, sample IDs, model, generation, judge, and execution
-configuration. A mismatch is rejected. Latency percentiles and throughput are
-engineering diagnostics for upstream acceptance; they are not SocialOmni paper
-metrics.
+configuration, including the declared server launch command and stable runtime
+identity. Completed per-judge scores are reused independently, while the final
+quality result still requires all three judges. Formal runs record zero warmup
+requests (unscored requests used to stabilize runtime) and one response-format
+preflight (an endpoint compatibility check) per active endpoint. A mismatch is
+rejected. Latency percentiles and throughput are engineering diagnostics for
+upstream acceptance; they are not SocialOmni paper metrics.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

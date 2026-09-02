@@ -88,7 +88,15 @@ def test_model_prompts_do_not_leak_reference_material(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize(
     ("raw", "expected"),
-    [("Answer: C", "C"), ("choice is B", "B"), ("unknown", "")],
+    [
+        ("Answer: C", "C"),
+        ("choice is B", "B"),
+        ("D", "D"),
+        ("C. Alice is speaking.", "C"),
+        ("A: The first option is correct.", "A"),
+        ("Because Alice is visible", ""),
+        ("unknown", ""),
+    ],
 )
 def test_choice_parsing(raw: str, expected: str) -> None:
     assert parse_choice(raw, ("A", "B", "C", "D")) == expected
@@ -191,6 +199,113 @@ def test_judge_phase_enforces_global_request_limit(monkeypatch, tmp_path: Path) 
     assert all(len(result["gold_judge_scores"]) == 3 for result in results)
 
 
+def test_judge_phase_reuses_partial_scores(monkeypatch, tmp_path: Path) -> None:
+    requested: list[str] = []
+    journal: list[dict] = []
+
+    async def fake_request(*_args, **kwargs) -> ChatResult:
+        requested.append(kwargs["payload"]["model"])
+        return ChatResult(
+            request_id=kwargs["request_id"],
+            text="75",
+            is_success=True,
+            latency_s=0.001,
+            status_code=200,
+        )
+
+    monkeypatch.setattr(socialomni_tasks, "request_chat_completion", fake_request)
+    sample = _level2(tmp_path / "video.mp4")
+    judges = [
+        JudgeSpec(name=name, model=name, base_url="http://example")
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+    existing = {
+        "record_type": "judge_score",
+        "phase": "level2_judge",
+        "sample_id": sample.sample_id,
+        "judge": "gpt-4o",
+        "score": 50,
+        "detail": {"raw_response": "50", "attempt": 1},
+        "error": "",
+    }
+
+    results = asyncio.run(
+        run_level2_judge_phase(
+            {sample.sample_id: sample},
+            [
+                {
+                    "sample_id": sample.sample_id,
+                    "gold_when": "YES",
+                    "gold_response": "candidate",
+                    "prefix_path": sample.video_path,
+                }
+            ],
+            judges=judges,
+            max_concurrency=3,
+            max_attempts=1,
+            timeout_s=1,
+            existing_judge_records=[existing],
+            result_hook=journal.append,
+        )
+    )
+
+    assert set(requested) == {"gemini-2.5-pro", "qwen3-omni"}
+    assert results[0]["gold_judge_scores"] == {
+        "gpt-4o": 50,
+        "gemini-2.5-pro": 75,
+        "qwen3-omni": 75,
+    }
+    assert sum(row["record_type"] == "judge_score" for row in journal) == 2
+    assert journal[-1]["record_type"] == "judge_result"
+
+
+def test_judge_phase_does_not_retry_nonretryable_4xx(
+    monkeypatch, tmp_path: Path
+) -> None:
+    calls = 0
+
+    async def fake_request(*_args, **kwargs) -> ChatResult:
+        nonlocal calls
+        calls += 1
+        return ChatResult(
+            request_id=kwargs["request_id"],
+            text="",
+            is_success=False,
+            latency_s=0.001,
+            status_code=400,
+            error="HTTP 400: bad request",
+            retryable=False,
+        )
+
+    monkeypatch.setattr(socialomni_tasks, "request_chat_completion", fake_request)
+    sample = _level2(tmp_path / "video.mp4")
+    judges = [
+        JudgeSpec(name=name, model=name, base_url="http://example")
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+
+    with pytest.raises(RuntimeError, match="judge request"):
+        asyncio.run(
+            run_level2_judge_phase(
+                {sample.sample_id: sample},
+                [
+                    {
+                        "sample_id": sample.sample_id,
+                        "gold_when": "YES",
+                        "gold_response": "candidate",
+                        "prefix_path": sample.video_path,
+                    }
+                ],
+                judges=judges,
+                max_concurrency=3,
+                max_attempts=3,
+                timeout_s=1,
+            )
+        )
+
+    assert calls == 3
+
+
 class _Response:
     def __init__(self, status: int, body: dict | str) -> None:
         self.status = status
@@ -241,6 +356,26 @@ def test_retry_records_http_failure_and_success() -> None:
     assert result.is_success is True
     assert [attempt["success"] for attempt in attempts] == [False, True]
     assert "HTTP 503" in attempts[0]["error"]
+
+
+def test_attempt_offset_keeps_attempt_numbers_monotonic() -> None:
+    attempts: list[dict] = []
+    session = _Session([_Response(200, {"choices": [{"message": {"content": "OK"}}]})])
+
+    asyncio.run(
+        request_chat_completion(
+            session,  # type: ignore[arg-type]
+            api_url="http://example/v1/chat/completions",
+            payload={},
+            request_id="request",
+            phase="test",
+            max_attempts=1,
+            attempt_offset=2,
+            attempt_hook=attempts.append,
+        )
+    )
+
+    assert attempts[0]["attempt"] == 3
 
 
 def test_video_helper_sends_embedded_audio_flag_and_preserves_http_error(
@@ -375,12 +510,119 @@ def test_resume_requires_identical_manifest(tmp_path: Path) -> None:
         artifacts.prepare({"model": "two"}, {"repository": {}}, resume=True)
 
 
+def test_contract_fingerprint_covers_stable_runtime_identity(tmp_path: Path) -> None:
+    dataset_info = SocialOmniDatasetInfo(
+        root=str(tmp_path),
+        version="revision",
+        level1_file="dataset.json",
+        level1_sha256="level1",
+        level2_file="annotations.json",
+        level2_sha256="level2",
+        manifest_file=None,
+        manifest_sha256=None,
+    )
+    config = SocialOmniEvalConfig(
+        dataset_root=str(tmp_path),
+        model="model",
+        model_revision="model-revision",
+        launch_command="serve --tp 8",
+    )
+    provenance = {
+        "repository": {"commit": "abc123", "dirty": False},
+        "host": {"platform": "Linux"},
+        "gpu": {
+            "nvidia_smi_csv": (
+                "0, NVIDIA H20, GPU-uuid, 97871, 580.1, P0, 500, 1980, 2619, 9.0"
+            )
+        },
+        "packages": {"sglang": "0.5.18"},
+        "dependency_freeze_sha256": "freeze-one",
+    }
+
+    first = socialomni_benchmark._contract(
+        config,
+        dataset_info=dataset_info,
+        level1_ids=["one"],
+        level2_ids=[],
+        judges=[],
+        provenance=provenance,
+    )
+    dynamic_gpu_change = socialomni_benchmark._contract(
+        config,
+        dataset_info=dataset_info,
+        level1_ids=["one"],
+        level2_ids=[],
+        judges=[],
+        provenance={
+            **provenance,
+            "gpu": {
+                "nvidia_smi_csv": (
+                    "0, NVIDIA H20, GPU-uuid, 97871, 580.1, P2, 500, 1200, 1600, 9.0"
+                )
+            },
+        },
+    )
+    changed_environment = socialomni_benchmark._contract(
+        config,
+        dataset_info=dataset_info,
+        level1_ids=["one"],
+        level2_ids=[],
+        judges=[],
+        provenance={**provenance, "dependency_freeze_sha256": "freeze-two"},
+    )
+
+    assert RunArtifacts.fingerprint(first) == RunArtifacts.fingerprint(
+        dynamic_gpu_change
+    )
+    assert RunArtifacts.fingerprint(first) != RunArtifacts.fingerprint(
+        changed_environment
+    )
+
+
+def test_resume_reuses_successful_unparseable_decisions() -> None:
+    assert socialomni_benchmark._level1_reusable(
+        {"request_completed": True, "is_success": False, "predicted_answer": ""}
+    )
+    assert socialomni_benchmark._level2_reusable(
+        {
+            "gold_when": "NO",
+            "predicted_when": "",
+            "when_success": False,
+            "when_request_completed": True,
+        }
+    )
+    assert socialomni_benchmark._level2_reusable(
+        {
+            "gold_when": "YES",
+            "when_request_completed": True,
+            "predicted_when": "",
+            "gold_response_request_completed": True,
+            "gold_response_success": False,
+            "gold_response": "",
+        }
+    )
+
+
+def test_formal_provenance_requires_model_launch_and_gpu_identity() -> None:
+    provenance = {
+        "repository": {"commit": "abc123", "dirty": False},
+        "artifacts": {"declared_model_revision": "model-revision"},
+        "launch_command": "serve --tp 8",
+        "gpu": {"nvidia_smi_csv": "0, NVIDIA H20"},
+    }
+
+    assert socialomni_benchmark._formal_provenance_complete(provenance)
+    assert not socialomni_benchmark._formal_provenance_complete(
+        {**provenance, "launch_command": None}
+    )
+
+
 @pytest.mark.parametrize(
     ("overrides", "expected"),
     [
         ({}, True),
         ({"when_success": False}, False),
-        ({"predicted_when": ""}, False),
+        ({"predicted_when": ""}, True),
         ({"gold_response_success": False}, False),
         ({"gold_response": ""}, False),
         (
@@ -428,6 +670,30 @@ def test_judge_resume_requires_scores_and_details_from_all_three_judges() -> Non
     assert socialomni_benchmark._judge_reusable(invalid_score, judge_names) is False
 
 
+def test_resume_recovers_individual_valid_judge_pairs() -> None:
+    judge_names = {"gpt-4o", "gemini-2.5-pro", "qwen3-omni"}
+    records = [
+        {
+            "record_type": "judge_score",
+            "sample_id": "one",
+            "judge": "gpt-4o",
+            "score": 75,
+            "detail": {"raw_response": "75"},
+        },
+        {
+            "record_type": "judge_score",
+            "sample_id": "one",
+            "judge": "gemini-2.5-pro",
+            "score": 80,
+            "detail": {"raw_response": "80"},
+        },
+    ]
+
+    assert socialomni_benchmark._reusable_judge_pairs(records, judge_names) == {
+        ("one", "gpt-4o")
+    }
+
+
 def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -458,7 +724,9 @@ def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
         },
     )
 
-    async def successful_preflight(_config: SocialOmniEvalConfig) -> None:
+    async def successful_preflight(
+        _config: SocialOmniEvalConfig, _attempt_hook
+    ) -> None:
         return None
 
     async def failed_phase(_samples, **kwargs):
@@ -541,7 +809,9 @@ def test_missing_model_result_marks_artifacts_incomplete(
         },
     )
 
-    async def successful_preflight(_config: SocialOmniEvalConfig) -> None:
+    async def successful_preflight(
+        _config: SocialOmniEvalConfig, _attempt_hook
+    ) -> None:
         return None
 
     async def empty_phase(_samples, **_kwargs):

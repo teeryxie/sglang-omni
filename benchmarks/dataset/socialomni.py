@@ -14,6 +14,15 @@ from typing import Any, Literal, TypeVar
 SOCIALOMNI_DATASET_ID = "alexisty/SocialOmni"
 SOCIALOMNI_DATASET_REVISION = "3b76009b45090eaa54007454c93a831f3cc8e1e6"
 SOCIALOMNI_JFS_SNAPSHOT = "7e88c7e1afed65eb6fda17aac76bebbe2da57ec7"
+SOCIALOMNI_LEVEL1_SHA256 = (
+    "051f2e7ca0618de6e78843c64a3800606904be819f47c1e5c771f1c6a49faa23"
+)
+SOCIALOMNI_LEVEL2_SHA256 = (
+    "87137aa2270f65e9c9e124e54dc5b73d9fe9c4bf9317219a4efe88feb036c058"
+)
+SOCIALOMNI_SUPPORTED_VERSIONS = frozenset(
+    {SOCIALOMNI_DATASET_REVISION, SOCIALOMNI_JFS_SNAPSHOT}
+)
 SOCIALOMNI_LEVEL1_SIZE = 2_000
 SOCIALOMNI_LEVEL2_SIZE = 209
 SOCIALOMNI_PAPER_CORE_SIZE = 200
@@ -92,6 +101,16 @@ class SocialOmniDatasetInfo:
         if len(hashes) == 1:
             return hashes[0]
         return hashlib.sha256("\n".join(hashes).encode()).hexdigest()
+
+    @property
+    def is_paper_snapshot(self) -> bool:
+        """Whether metadata exactly matches the public paper dataset snapshot."""
+
+        return (
+            self.version in SOCIALOMNI_SUPPORTED_VERSIONS
+            and self.level1_sha256 == SOCIALOMNI_LEVEL1_SHA256
+            and self.level2_sha256 == SOCIALOMNI_LEVEL2_SHA256
+        )
 
 
 def _sha256(path: Path) -> str:

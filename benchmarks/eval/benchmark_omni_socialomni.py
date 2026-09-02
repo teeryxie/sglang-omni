@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import sys
 import time
@@ -206,23 +207,21 @@ def _latest_by_sample(
 
 
 def _level1_reusable(record: dict[str, Any]) -> bool:
-    return bool(record.get("is_success")) and record.get("predicted_answer") in {
-        "A",
-        "B",
-        "C",
-        "D",
-    }
+    # A successful but unparseable response is a fixed wrong answer, not a reason
+    # to sample the model again during resume.
+    return bool(record.get("request_completed", record.get("is_success")))
 
 
 def _level2_reusable(record: dict[str, Any]) -> bool:
-    if not record.get("when_success") or record.get("predicted_when") not in {
-        "YES",
-        "NO",
-    }:
+    # Preserve successful unparseable decisions in the strict denominator.
+    if not record.get("when_request_completed", record.get("when_success")):
         return False
-    return record.get("gold_when") != "YES" or (
-        bool(record.get("gold_response_success"))
-        and bool(str(record.get("gold_response", "")).strip())
+    if record.get("gold_when") != "YES":
+        return True
+    if "gold_response_request_completed" in record:
+        return bool(record["gold_response_request_completed"])
+    return bool(record.get("gold_response_success")) and bool(
+        str(record.get("gold_response", "")).strip()
     )
 
 
@@ -234,8 +233,61 @@ def _judge_reusable(record: dict[str, Any], expected_names: set[str]) -> bool:
     if not isinstance(details, dict) or set(details) != expected_names:
         return False
     return all(
-        not isinstance(score, bool) and score in SOCIALOMNI_SCORE_BUCKETS
+        not isinstance(score, bool)
+        and isinstance(score, (int, float))
+        and math.isfinite(float(score))
+        and score in SOCIALOMNI_SCORE_BUCKETS
         for score in scores.values()
+    )
+
+
+def _reusable_judge_pairs(
+    records: list[dict[str, Any]], expected_names: set[str]
+) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for record in records:
+        sample_id = str(record.get("sample_id", ""))
+        if not sample_id:
+            continue
+        if record.get("record_type") == "judge_score":
+            name = str(record.get("judge", ""))
+            score = record.get("score")
+            if (
+                name in expected_names
+                and not isinstance(score, bool)
+                and isinstance(score, (int, float))
+                and math.isfinite(float(score))
+                and score in SOCIALOMNI_SCORE_BUCKETS
+                and isinstance(record.get("detail"), dict)
+            ):
+                pairs.add((sample_id, name))
+        elif record.get("record_type") == "judge_result":
+            scores = record.get("gold_judge_scores")
+            details = record.get("judge_details")
+            if isinstance(scores, dict) and isinstance(details, dict):
+                for name, score in scores.items():
+                    if (
+                        name in expected_names
+                        and not isinstance(score, bool)
+                        and isinstance(score, (int, float))
+                        and math.isfinite(float(score))
+                        and score in SOCIALOMNI_SCORE_BUCKETS
+                        and isinstance(details.get(name), dict)
+                    ):
+                        pairs.add((sample_id, name))
+    return pairs
+
+
+def _formal_provenance_complete(provenance: dict[str, Any]) -> bool:
+    repository = provenance.get("repository") or {}
+    artifacts = provenance.get("artifacts") or {}
+    gpu = provenance.get("gpu") or {}
+    return bool(
+        repository.get("commit")
+        and repository.get("dirty") is False
+        and artifacts.get("declared_model_revision")
+        and provenance.get("launch_command")
+        and gpu.get("nvidia_smi_csv")
     )
 
 
@@ -288,6 +340,17 @@ def _wall_speed(completed: int, elapsed_s: float) -> dict[str, Any]:
     }
 
 
+def _stable_gpu_inventory(provenance: dict[str, Any]) -> list[list[str]]:
+    """Keep static GPU identity fields while excluding clocks and P-state."""
+
+    raw = str((provenance.get("gpu") or {}).get("nvidia_smi_csv") or "")
+    return [
+        [field.strip() for field in line.split(",")[:5]]
+        for line in raw.splitlines()
+        if line.strip()
+    ]
+
+
 def _contract(
     config: SocialOmniEvalConfig,
     *,
@@ -295,10 +358,10 @@ def _contract(
     level1_ids: list[str],
     level2_ids: list[str],
     judges: list[JudgeSpec],
-    repository_commit: str | None,
+    provenance: dict[str, Any],
 ) -> dict[str, Any]:
     return {
-        "repository_commit": repository_commit,
+        "repository_commit": (provenance.get("repository") or {}).get("commit"),
         "protocol_version": PROTOCOL_VERSION,
         "model": config.model,
         "model_revision": config.model_revision,
@@ -328,19 +391,36 @@ def _contract(
             "bootstrap_seed": config.bootstrap_seed,
             "bootstrap_samples": config.bootstrap_samples,
             "request_rate": None,
+            "warmup_requests": {"main": 0, "per_judge": 0},
             "preflight_requests": {"main": 1, "per_judge": 1},
+        },
+        "runtime_identity": {
+            "launch_command": config.launch_command,
+            "host_platform": (provenance.get("host") or {}).get("platform"),
+            "gpu_inventory": _stable_gpu_inventory(provenance),
+            "packages": provenance.get("packages"),
+            "dependency_freeze_sha256": provenance.get("dependency_freeze_sha256"),
         },
     }
 
 
-async def _preflight_main(config: SocialOmniEvalConfig) -> None:
+async def _preflight_main(
+    config: SocialOmniEvalConfig, attempt_hook: Callable[[dict[str, Any]], None]
+) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
     async with _client_session(timeout) as session:
-        await preflight_endpoint(session, base_url=config.base_url, model=config.model)
+        await preflight_endpoint(
+            session,
+            base_url=config.base_url,
+            model=config.model,
+            attempt_hook=attempt_hook,
+        )
 
 
 async def _preflight_judges(
-    config: SocialOmniEvalConfig, judges: list[JudgeSpec]
+    config: SocialOmniEvalConfig,
+    judges: list[JudgeSpec],
+    attempt_hook: Callable[[dict[str, Any]], None],
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
     async with _client_session(timeout) as session:
@@ -352,6 +432,7 @@ async def _preflight_judges(
                 api_key_env=judge.api_key_env,
                 judge_score=True,
                 max_tokens=judge.max_tokens,
+                attempt_hook=attempt_hook,
             )
 
 
@@ -429,7 +510,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         level1_ids=[sample.sample_id for sample in level1_samples],
         level2_ids=[sample.sample_id for sample in level2_samples],
         judges=judges,
-        repository_commit=provenance["repository"]["commit"],
+        provenance=provenance,
     )
     run_id = config.run_id or (
         f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
@@ -439,7 +520,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     artifacts.prepare(contract, provenance, resume=config.resume)
 
     try:
-        await _preflight_main(config)
+        await _preflight_main(config, artifacts.attempt_hook)
         summary: dict[str, Any] = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
@@ -528,10 +609,10 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 _level2_reusable,
             )
 
-            existing_judges = _latest_by_sample(
-                RunArtifacts.read_jsonl(artifacts.judges_path), "judge_result"
-            )
+            judge_journal = RunArtifacts.read_jsonl(artifacts.judges_path)
             expected_names = {judge.name for judge in judges}
+            existing_judges = _latest_by_sample(judge_journal, "judge_result")
+            reusable_pairs = _reusable_judge_pairs(judge_journal, expected_names)
             reusable_judges = {
                 sample_id: record
                 for sample_id, record in existing_judges.items()
@@ -545,7 +626,16 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 and str(record["sample_id"]) not in reusable_judges
             ]
             if judge_pending:
-                await _preflight_judges(config, judges)
+                pending_ids = {str(record["sample_id"]) for record in judge_pending}
+                judges_to_run = [
+                    judge
+                    for judge in judges
+                    if any(
+                        (sample_id, judge.name) not in reusable_pairs
+                        for sample_id in pending_ids
+                    )
+                ]
+                await _preflight_judges(config, judges_to_run, artifacts.attempt_hook)
             judge_phase_started = time.perf_counter()
             fresh_judges = await run_level2_judge_phase(
                 {sample.sample_id: sample for sample in level2_samples},
@@ -554,6 +644,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 max_concurrency=config.judge_max_concurrency,
                 max_attempts=config.max_attempts,
                 timeout_s=config.timeout_s,
+                existing_judge_records=judge_journal,
                 attempt_hook=artifacts.attempt_hook,
                 result_hook=artifacts.judge_result_hook,
             )
@@ -619,17 +710,25 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             )
             and {judge.name for judge in judges} == set(SOCIALOMNI_JUDGE_NAMES)
         )
-        clean_commit = (
-            provenance["repository"]["commit"] is not None
+        clean_commit = bool(
+            provenance["repository"]["commit"]
             and provenance["repository"]["dirty"] is False
         )
+        pinned_dataset = dataset_info.is_paper_snapshot
+        reproducible_provenance = _formal_provenance_complete(provenance)
         all_records_complete = all(phase["complete"] for phase in completion.values())
         run_status = "complete" if all_records_complete else "incomplete"
         summary["status"] = run_status
         summary["completion"] = completion
         summary["clean_repository_commit"] = clean_commit
+        summary["paper_dataset_snapshot_verified"] = pinned_dataset
+        summary["reproducible_provenance_complete"] = reproducible_provenance
         summary["formal_evaluation_complete"] = (
-            formal_level1 and formal_level2 and clean_commit and all_records_complete
+            formal_level1
+            and formal_level2
+            and pinned_dataset
+            and reproducible_provenance
+            and all_records_complete
         )
         summary["failures"] = RunArtifacts.read_jsonl(artifacts.failures_path)
         artifacts.finish(summary, status=run_status)

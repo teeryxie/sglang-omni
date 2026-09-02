@@ -25,6 +25,17 @@ from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLeve
 JUDGE_SCORE_BUCKETS = frozenset({0, 25, 50, 75, 100})
 RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
 PREFIX_ENCODING_VERSION = "h264-aac-v1"
+PREFIX_ENCODING_CONFIG = {
+    "video_stream": "0:v:0",
+    "audio_stream": "0:a?",
+    "video_codec": "libx264",
+    "preset": "fast",
+    "crf": "18",
+    "audio_codec": "aac",
+    "audio_bitrate": "192k",
+    "avoid_negative_ts": "make_zero",
+    "movflags": "+faststart",
+}
 T = TypeVar("T")
 R = TypeVar("R")
 
@@ -60,6 +71,13 @@ class ChatResult:
     completion_tokens: int = 0
     status_code: int | None = None
     error: str = ""
+    retryable: bool = False
+
+    @property
+    def request_completed(self) -> bool:
+        """Whether the endpoint returned a successful HTTP response."""
+
+        return self.status_code is not None and 200 <= self.status_code < 300
 
 
 AttemptHook = Callable[[dict[str, Any]], None]
@@ -173,6 +191,7 @@ async def request_chat_completion(
     api_key_env: str | None = None,
     max_attempts: int = 3,
     retry_backoff_s: float = 1.0,
+    attempt_offset: int = 0,
     attempt_hook: AttemptHook | None = None,
 ) -> ChatResult:
     """Send one request with bounded retry and an audit record per attempt."""
@@ -222,6 +241,7 @@ async def request_chat_completion(
             completion_tokens=completion_tokens,
             status_code=status,
             error=error,
+            retryable=retryable,
         )
         if attempt_hook:
             attempt_hook(
@@ -229,7 +249,7 @@ async def request_chat_completion(
                     "record_type": "attempt",
                     "phase": phase,
                     "request_id": request_id,
-                    "attempt": attempt,
+                    "attempt": attempt + attempt_offset,
                     "success": success,
                     "status_code": status,
                     "latency_s": round(latency, 6),
@@ -251,6 +271,7 @@ async def preflight_endpoint(
     api_key_env: str | None = None,
     judge_score: bool = False,
     max_tokens: int = 4,
+    attempt_hook: AttemptHook | None = None,
 ) -> None:
     result = await request_chat_completion(
         session,
@@ -276,6 +297,7 @@ async def preflight_endpoint(
         phase="preflight",
         api_key_env=api_key_env,
         max_attempts=1,
+        attempt_hook=attempt_hook,
     )
     if not result.is_success:
         raise RuntimeError(f"endpoint preflight failed for {model}: {result.error}")
@@ -293,10 +315,11 @@ def parse_choice(text: str, choices: Sequence[str]) -> str:
     tagged = re.search(rf"(?:ANSWER|CHOICE)\s*(?:IS|:)?\s*([{alphabet}])\b", content)
     if tagged:
         return tagged.group(1)
-    if content[0] in choices:
-        return content[0]
-    match = re.search(rf"\b([{alphabet}])\b", content)
-    return match.group(1) if match else ""
+    plain = re.fullmatch(rf"([{alphabet}])[.)]?", content)
+    if plain:
+        return plain.group(1)
+    leading = re.match(rf"^([{alphabet}])(?:[.)]|\s*[:\-])\s+", content)
+    return leading.group(1) if leading else ""
 
 
 def parse_when(text: str) -> str:
@@ -427,23 +450,23 @@ def build_ffmpeg_prefix_command(
         "-t",
         f"{timestamp_s:.6f}",
         "-map",
-        "0:v:0",
+        PREFIX_ENCODING_CONFIG["video_stream"],
         "-map",
-        "0:a?",
+        PREFIX_ENCODING_CONFIG["audio_stream"],
         "-c:v",
-        "libx264",
+        PREFIX_ENCODING_CONFIG["video_codec"],
         "-preset",
-        "fast",
+        PREFIX_ENCODING_CONFIG["preset"],
         "-crf",
-        "18",
+        PREFIX_ENCODING_CONFIG["crf"],
         "-c:a",
-        "aac",
+        PREFIX_ENCODING_CONFIG["audio_codec"],
         "-b:a",
-        "192k",
+        PREFIX_ENCODING_CONFIG["audio_bitrate"],
         "-avoid_negative_ts",
-        "make_zero",
+        PREFIX_ENCODING_CONFIG["avoid_negative_ts"],
         "-movflags",
-        "+faststart",
+        PREFIX_ENCODING_CONFIG["movflags"],
         "-y",
         str(output),
     ]
@@ -478,8 +501,15 @@ async def create_video_prefix(
     source_sha = await asyncio.to_thread(_sha256_file, source)
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    key_payload = f"{source_sha}:{timestamp_s:.6f}:{PREFIX_ENCODING_VERSION}"
-    key = hashlib.sha256(key_payload.encode()).hexdigest()
+    key_payload = {
+        "source_sha256": source_sha,
+        "timestamp_s": f"{timestamp_s:.6f}",
+        "encoding_version": PREFIX_ENCODING_VERSION,
+        "encoding": PREFIX_ENCODING_CONFIG,
+    }
+    key = hashlib.sha256(
+        json.dumps(key_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
     output = cache / f"{key}.mp4"
     if output.is_file() and output.stat().st_size > 0:
         return output
@@ -584,6 +614,7 @@ async def run_level1_model_phase(
                 "predicted_answer": prediction,
                 "visibility": sample.visibility,
                 "is_success": result.is_success,
+                "request_completed": result.request_completed,
                 "raw_response": result.text,
                 "latency_s": round(result.latency_s, 6),
                 "prompt_tokens": result.prompt_tokens,
@@ -661,10 +692,14 @@ async def run_level2_model_phase(
                 "predicted_when": predicted,
                 "when_raw_response": when_result.text,
                 "when_success": when_result.is_success,
+                "when_request_completed": when_result.request_completed,
                 "when_latency_s": round(when_result.latency_s, 6),
                 "gold_response": response_result.text if response_result else "",
                 "gold_response_success": (
                     response_result.is_success if response_result else None
+                ),
+                "gold_response_request_completed": (
+                    response_result.request_completed if response_result else None
                 ),
                 "gold_response_latency_s": (
                     round(response_result.latency_s, 6) if response_result else None
@@ -695,6 +730,7 @@ async def run_level2_judge_phase(
     max_concurrency: int,
     max_attempts: int,
     timeout_s: int,
+    existing_judge_records: Sequence[dict[str, Any]] = (),
     attempt_hook: AttemptHook | None = None,
     result_hook: RecordHook | None = None,
 ) -> list[dict[str, Any]]:
@@ -710,7 +746,51 @@ async def run_level2_judge_phase(
         if record.get("gold_when") == "YES"
         and str(record.get("gold_response", "")).strip()
     ]
-    jobs = [(record, judge) for record in eligible for judge in judges]
+    eligible_ids = {str(record["sample_id"]) for record in eligible}
+    expected_names = {judge.name for judge in judges}
+    scores_by_sample: dict[str, dict[str, int]] = {}
+    details_by_sample: dict[str, dict[str, Any]] = {}
+    for existing in existing_judge_records:
+        sample_id = str(existing.get("sample_id", ""))
+        if sample_id not in eligible_ids:
+            continue
+        if existing.get("record_type") == "judge_score":
+            name = str(existing.get("judge", ""))
+            score = existing.get("score")
+            detail = existing.get("detail")
+            if (
+                name in expected_names
+                and not isinstance(score, bool)
+                and isinstance(score, (int, float))
+                and math.isfinite(float(score))
+                and score in JUDGE_SCORE_BUCKETS
+                and isinstance(detail, dict)
+            ):
+                scores_by_sample.setdefault(sample_id, {})[name] = int(score)
+                details_by_sample.setdefault(sample_id, {})[name] = detail
+        elif existing.get("record_type") == "judge_result":
+            scores = existing.get("gold_judge_scores")
+            details = existing.get("judge_details")
+            if isinstance(scores, dict) and isinstance(details, dict):
+                for name, score in scores.items():
+                    if (
+                        name in expected_names
+                        and not isinstance(score, bool)
+                        and isinstance(score, (int, float))
+                        and math.isfinite(float(score))
+                        and score in JUDGE_SCORE_BUCKETS
+                        and isinstance(details.get(name), dict)
+                    ):
+                        scores_by_sample.setdefault(sample_id, {})[name] = int(score)
+                        details_by_sample.setdefault(sample_id, {})[name] = details[
+                            name
+                        ]
+    jobs = [
+        (record, judge)
+        for record in eligible
+        for judge in judges
+        if judge.name not in scores_by_sample.get(str(record["sample_id"]), {})
+    ]
     async with _client_session(timeout) as session:
 
         async def run_one(
@@ -726,7 +806,9 @@ async def run_level2_judge_phase(
                 max_tokens=judge.max_tokens,
             )
             last_result: ChatResult | None = None
+            attempts_used = 0
             for parse_attempt in range(1, max_attempts + 1):
+                attempts_used = parse_attempt
                 async with semaphores[judge.name]:
                     last_result = await request_chat_completion(
                         session,
@@ -736,6 +818,7 @@ async def run_level2_judge_phase(
                         phase=f"judge:{judge.name}",
                         api_key_env=judge.api_key_env,
                         max_attempts=1,
+                        attempt_offset=parse_attempt - 1,
                         attempt_hook=attempt_hook,
                     )
                 score = (
@@ -744,17 +827,29 @@ async def run_level2_judge_phase(
                     else None
                 )
                 if score is not None:
-                    return {
+                    detail = {
+                        "raw_response": last_result.text,
+                        "latency_s": round(last_result.latency_s, 6),
+                        "attempt": parse_attempt,
+                    }
+                    result = {
                         "sample_id": sample_id,
                         "judge": judge.name,
                         "score": score,
-                        "detail": {
-                            "raw_response": last_result.text,
-                            "latency_s": round(last_result.latency_s, 6),
-                            "attempt": parse_attempt,
-                        },
+                        "detail": detail,
                         "error": "",
                     }
+                    if result_hook:
+                        result_hook(
+                            {
+                                "record_type": "judge_score",
+                                "phase": "level2_judge",
+                                **result,
+                            }
+                        )
+                    return result
+                if not last_result.is_success and not last_result.retryable:
+                    break
                 if parse_attempt < max_attempts:
                     await asyncio.sleep(2 ** (parse_attempt - 1))
             assert last_result is not None
@@ -765,14 +860,12 @@ async def run_level2_judge_phase(
                 "detail": {
                     "raw_response": last_result.text,
                     "latency_s": round(last_result.latency_s, 6),
-                    "attempt": max_attempts,
+                    "attempt": attempts_used,
                 },
                 "error": last_result.error or "invalid score response",
             }
 
         outcomes = await bounded_map(jobs, run_one, max_concurrency)
-        scores_by_sample: dict[str, dict[str, int]] = {}
-        details_by_sample: dict[str, dict[str, Any]] = {}
         failures: list[dict[str, Any]] = []
         for outcome in outcomes:
             sample_id = str(outcome["sample_id"])
@@ -787,7 +880,6 @@ async def run_level2_judge_phase(
             )
 
         results: list[dict[str, Any]] = []
-        expected_names = {judge.name for judge in judges}
         for record in eligible:
             sample_id = str(record["sample_id"])
             scores = scores_by_sample.get(sample_id, {})
