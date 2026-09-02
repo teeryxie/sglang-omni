@@ -159,6 +159,10 @@ def _message_text(body: dict[str, Any]) -> str:
     return ""
 
 
+def _client_session(timeout: aiohttp.ClientTimeout) -> aiohttp.ClientSession:
+    return aiohttp.ClientSession(timeout=timeout, trust_env=True)
+
+
 async def request_chat_completion(
     session: aiohttp.ClientSession,
     *,
@@ -550,7 +554,7 @@ async def run_level1_model_phase(
     result_hook: RecordHook | None = None,
 ) -> list[dict[str, Any]]:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _client_session(timeout) as session:
 
         async def run_one(sample: SocialOmniLevel1Sample) -> dict[str, Any]:
             result = await request_chat_completion(
@@ -608,7 +612,7 @@ async def run_level2_model_phase(
     result_hook: RecordHook | None = None,
 ) -> list[dict[str, Any]]:
     timeout = aiohttp.ClientTimeout(total=timeout_s)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _client_session(timeout) as session:
 
         async def run_one(sample: SocialOmniLevel2Sample) -> dict[str, Any]:
             started = time.perf_counter()
@@ -707,7 +711,7 @@ async def run_level2_judge_phase(
         and str(record.get("gold_response", "")).strip()
     ]
     jobs = [(record, judge) for record in eligible for judge in judges]
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _client_session(timeout) as session:
 
         async def run_one(
             job: tuple[dict[str, Any], JudgeSpec],

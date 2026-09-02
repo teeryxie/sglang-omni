@@ -22,6 +22,7 @@ from benchmarks.eval.benchmark_omni_socialomni import (
 from benchmarks.tasks.socialomni import (
     ChatResult,
     JudgeSpec,
+    _client_session,
     bounded_map,
     build_ffmpeg_prefix_command,
     build_judge_prompt,
@@ -624,6 +625,20 @@ def test_ffmpeg_resolver_falls_back_to_project_binary(
     )
 
     assert resolve_ffmpeg_executable() == str(bundled)
+
+
+def test_socialomni_http_sessions_honor_proxy_environment(monkeypatch) -> None:
+    observed = {}
+
+    def fake_session(**kwargs):
+        observed.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(socialomni_tasks.aiohttp, "ClientSession", fake_session)
+    timeout = socialomni_tasks.aiohttp.ClientTimeout(total=1)
+
+    assert _client_session(timeout) is not None
+    assert observed == {"timeout": timeout, "trust_env": True}
 
 
 @pytest.mark.skipif(
