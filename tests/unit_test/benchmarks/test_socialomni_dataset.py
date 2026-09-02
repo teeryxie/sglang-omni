@@ -18,6 +18,7 @@ from benchmarks.dataset.socialomni import (
     load_socialomni_level1_samples,
     load_socialomni_level2_samples,
     parse_socialomni_timestamp,
+    socialomni_media_manifest_covers,
 )
 
 
@@ -297,14 +298,31 @@ def test_inspection_includes_snapshot_manifest_in_dataset_identity(
 ) -> None:
     _write_json(tmp_path / "data/level_1/dataset.json", [])
     manifest = tmp_path / ".telos-manifest.sha256"
-    manifest.write_text("first\n", encoding="utf-8")
+    manifest.write_text(f"{'1' * 64}  data/level_1/videos/one.mp4\n", encoding="utf-8")
 
     first = inspect_socialomni_dataset(tmp_path)
-    manifest.write_text("second\n", encoding="utf-8")
+    manifest.write_text(f"{'2' * 64}  data/level_1/videos/one.mp4\n", encoding="utf-8")
     second = inspect_socialomni_dataset(tmp_path)
 
     assert first.level1_sha256 == second.level1_sha256
     assert first.dataset_sha256 != second.dataset_sha256
+
+
+def test_selected_media_must_be_listed_in_snapshot_manifest(tmp_path: Path) -> None:
+    _write_json(tmp_path / "data/level_1/dataset.json", [])
+    video = tmp_path / "data/level_1/videos/one.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"video")
+    manifest = tmp_path / ".telos-manifest.sha256"
+    manifest.write_text(f"{'1' * 64}  data/level_1/videos/one.mp4\n", encoding="utf-8")
+
+    info = inspect_socialomni_dataset(tmp_path)
+
+    assert info.manifest_covers_media
+    assert socialomni_media_manifest_covers(info, [str(video)])
+    assert not socialomni_media_manifest_covers(
+        info, [str(tmp_path / "data/level_1/videos/missing.mp4")]
+    )
 
 
 @pytest.mark.parametrize(
@@ -320,6 +338,7 @@ def test_paper_snapshot_accepts_public_and_jfs_identities(version: str) -> None:
         level2_sha256=SOCIALOMNI_LEVEL2_SHA256,
         manifest_file=None,
         manifest_sha256=None,
+        manifest_covers_media=True,
     )
 
     assert info.is_paper_snapshot
@@ -335,6 +354,9 @@ def test_prepare_socialomni_uses_pinned_snapshot_revision(
 
     def fake_snapshot_download(**kwargs: object) -> str:
         observed.update(kwargs)
+        media = Path(str(kwargs["local_dir"])) / "data/level_1/videos/one.mp4"
+        media.parent.mkdir(parents=True)
+        media.write_bytes(b"video")
         return "/cache/socialomni"
 
     monkeypatch.setitem(
@@ -373,3 +395,5 @@ def test_prepare_socialomni_uses_pinned_snapshot_revision(
         "dataset_id": prepare.SOCIALOMNI_DATASET_ID,
         "revision": SOCIALOMNI_DATASET_REVISION,
     }
+    manifest = (destination / ".socialomni-files.sha256").read_text()
+    assert "data/level_1/videos/one.mp4" in manifest

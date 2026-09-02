@@ -312,9 +312,9 @@ def parse_choice(text: str, choices: Sequence[str]) -> str:
     if not content:
         return ""
     alphabet = "".join(re.escape(choice) for choice in choices)
-    tagged = re.search(rf"(?:ANSWER|CHOICE)\s*(?:IS|:)?\s*([{alphabet}])\b", content)
+    tagged = re.findall(rf"(?:ANSWER|CHOICE)\s*(?:IS|:)?\s*([{alphabet}])\b", content)
     if tagged:
-        return tagged.group(1)
+        return tagged[0] if len(set(tagged)) == 1 else ""
     plain = re.fullmatch(rf"([{alphabet}])[.)]?", content)
     if plain:
         return plain.group(1)
@@ -613,6 +613,7 @@ async def run_level1_model_phase(
                 "gold_answer": sample.answer,
                 "predicted_answer": prediction,
                 "visibility": sample.visibility,
+                "stage_complete": True,
                 "is_success": result.is_success,
                 "request_completed": result.request_completed,
                 "raw_response": result.text,
@@ -689,6 +690,7 @@ async def run_level2_model_phase(
                 "prefix_path": str(prefix),
                 "timestamp_s": sample.timestamp_s,
                 "gold_when": sample.gold_when,
+                "stage_complete": True,
                 "predicted_when": predicted,
                 "when_raw_response": when_result.text,
                 "when_success": when_result.is_success,
@@ -848,12 +850,19 @@ async def run_level2_judge_phase(
                             }
                         )
                     return result
-                if not last_result.is_success and not last_result.retryable:
+                if (
+                    not last_result.is_success
+                    and last_result.status_code is not None
+                    and last_result.status_code >= 400
+                    and not last_result.retryable
+                ):
                     break
                 if parse_attempt < max_attempts:
                     await asyncio.sleep(2 ** (parse_attempt - 1))
             assert last_result is not None
-            return {
+            failure = {
+                "record_type": "judge_failure",
+                "phase": "level2_judge",
                 "sample_id": sample_id,
                 "judge": judge.name,
                 "score": None,
@@ -864,6 +873,9 @@ async def run_level2_judge_phase(
                 },
                 "error": last_result.error or "invalid score response",
             }
+            if result_hook:
+                result_hook(failure)
+            return failure
 
         outcomes = await bounded_map(jobs, run_one, max_concurrency)
         failures: list[dict[str, Any]] = []

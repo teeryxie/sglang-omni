@@ -94,6 +94,7 @@ def test_model_prompts_do_not_leak_reference_material(tmp_path: Path) -> None:
         ("D", "D"),
         ("C. Alice is speaking.", "C"),
         ("A: The first option is correct.", "A"),
+        ("Answer: B\nFinal Answer: C", ""),
         ("Because Alice is visible", ""),
         ("unknown", ""),
     ],
@@ -284,6 +285,7 @@ def test_judge_phase_does_not_retry_nonretryable_4xx(
         for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
     ]
 
+    journal: list[dict] = []
     with pytest.raises(RuntimeError, match="judge request"):
         asyncio.run(
             run_level2_judge_phase(
@@ -300,10 +302,62 @@ def test_judge_phase_does_not_retry_nonretryable_4xx(
                 max_concurrency=3,
                 max_attempts=3,
                 timeout_s=1,
+                result_hook=journal.append,
             )
         )
 
     assert calls == 3
+    assert [row["record_type"] for row in journal] == ["judge_failure"] * 3
+
+
+def test_judge_phase_retries_invalid_2xx_scores(monkeypatch, tmp_path: Path) -> None:
+    calls: dict[str, int] = {}
+
+    async def fake_request(*_args, **kwargs) -> ChatResult:
+        request_id = kwargs["request_id"]
+        calls[request_id] = calls.get(request_id, 0) + 1
+        first = calls[request_id] == 1
+        return ChatResult(
+            request_id=request_id,
+            text="" if first else "75",
+            is_success=not first,
+            latency_s=0.001,
+            status_code=200,
+            error="empty response" if first else "",
+            retryable=False,
+        )
+
+    async def no_sleep(*_args) -> None:
+        return None
+
+    monkeypatch.setattr(socialomni_tasks, "request_chat_completion", fake_request)
+    monkeypatch.setattr(socialomni_tasks.asyncio, "sleep", no_sleep)
+    sample = _level2(tmp_path / "video.mp4")
+    judges = [
+        JudgeSpec(name=name, model=name, base_url="http://example")
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+
+    results = asyncio.run(
+        run_level2_judge_phase(
+            {sample.sample_id: sample},
+            [
+                {
+                    "sample_id": sample.sample_id,
+                    "gold_when": "YES",
+                    "gold_response": "candidate",
+                    "prefix_path": sample.video_path,
+                }
+            ],
+            judges=judges,
+            max_concurrency=3,
+            max_attempts=2,
+            timeout_s=1,
+        )
+    )
+
+    assert set(results[0]["gold_judge_scores"].values()) == {75}
+    assert set(calls.values()) == {2}
 
 
 class _Response:
@@ -579,22 +633,22 @@ def test_contract_fingerprint_covers_stable_runtime_identity(tmp_path: Path) -> 
     )
 
 
-def test_resume_reuses_successful_unparseable_decisions() -> None:
+def test_resume_reuses_all_completed_model_decisions() -> None:
     assert socialomni_benchmark._level1_reusable(
-        {"request_completed": True, "is_success": False, "predicted_answer": ""}
+        {"stage_complete": True, "is_success": False, "predicted_answer": ""}
     )
     assert socialomni_benchmark._level2_reusable(
         {
             "gold_when": "NO",
             "predicted_when": "",
             "when_success": False,
-            "when_request_completed": True,
+            "stage_complete": True,
         }
     )
     assert socialomni_benchmark._level2_reusable(
         {
             "gold_when": "YES",
-            "when_request_completed": True,
+            "stage_complete": True,
             "predicted_when": "",
             "gold_response_request_completed": True,
             "gold_response_success": False,
@@ -603,51 +657,38 @@ def test_resume_reuses_successful_unparseable_decisions() -> None:
     )
 
 
-def test_formal_provenance_requires_model_launch_and_gpu_identity() -> None:
+def test_formal_provenance_requires_exact_h20_and_sglang_environment() -> None:
     provenance = {
         "repository": {"commit": "abc123", "dirty": False},
         "artifacts": {"declared_model_revision": "model-revision"},
         "launch_command": "serve --tp 8",
-        "gpu": {"nvidia_smi_csv": "0, NVIDIA H20"},
+        "gpu": {
+            "nvidia_smi_csv": "\n".join(f"{index}, NVIDIA H20" for index in range(8))
+        },
+        "packages": {"sglang": "0.5.18"},
     }
 
     assert socialomni_benchmark._formal_provenance_complete(provenance)
     assert not socialomni_benchmark._formal_provenance_complete(
         {**provenance, "launch_command": None}
     )
+    assert not socialomni_benchmark._formal_provenance_complete(
+        {**provenance, "packages": {"sglang": "0.5.16.dev"}}
+    )
 
 
-@pytest.mark.parametrize(
-    ("overrides", "expected"),
-    [
-        ({}, True),
-        ({"when_success": False}, False),
-        ({"predicted_when": ""}, True),
-        ({"gold_response_success": False}, False),
-        ({"gold_response": ""}, False),
-        (
-            {
-                "gold_when": "NO",
-                "gold_response_success": None,
-                "gold_response": "",
-            },
-            True,
-        ),
-    ],
-)
-def test_level2_resume_only_reuses_complete_model_results(
-    overrides: dict, expected: bool
-) -> None:
+@pytest.mark.parametrize("stage_complete", [True, False])
+def test_level2_resume_only_reuses_complete_model_results(stage_complete: bool) -> None:
     record = {
         "gold_when": "YES",
         "predicted_when": "YES",
         "when_success": True,
         "gold_response": "candidate",
         "gold_response_success": True,
+        "stage_complete": stage_complete,
     }
-    record.update(overrides)
 
-    assert socialomni_benchmark._level2_reusable(record) is expected
+    assert socialomni_benchmark._level2_reusable(record) is stage_complete
 
 
 def test_judge_resume_requires_scores_and_details_from_all_three_judges() -> None:
@@ -694,7 +735,22 @@ def test_resume_recovers_individual_valid_judge_pairs() -> None:
     }
 
 
-def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
+def test_fresh_judge_request_count_uses_missing_pairs() -> None:
+    judges = [
+        JudgeSpec(name=name, model=name, base_url="http://example")
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+    assert (
+        socialomni_benchmark._fresh_judge_request_count(
+            [{"sample_id": "one"}],
+            judges,
+            {("one", "gpt-4o"), ("one", "gemini-2.5-pro")},
+        )
+        == 1
+    )
+
+
+def test_failed_model_result_is_fixed_wrong_answer_and_preserves_artifacts(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     sample = _level1(tmp_path / "video.mp4")
@@ -737,6 +793,7 @@ def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
             "gold_answer": sample.answer,
             "predicted_answer": "",
             "visibility": sample.visibility,
+            "stage_complete": True,
             "is_success": False,
             "latency_s": 0.1,
             "error": "HTTP 500: internal error",
@@ -759,21 +816,21 @@ def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
     result = asyncio.run(socialomni_benchmark.run_socialomni(config))
 
     artifact_dir = tmp_path / "results" / "abc123" / "failed-run"
-    assert result["status"] == "incomplete"
+    assert result["status"] == "complete"
     assert result["formal_evaluation_complete"] is False
     assert result["completion"]["level1_model"] == {
         "expected": 1,
         "present": 1,
-        "successful": 0,
+        "completed": 1,
         "missing_sample_ids": [],
-        "failed_sample_ids": ["l1"],
-        "complete": False,
+        "incomplete_sample_ids": [],
+        "complete": True,
     }
     assert json.loads((artifact_dir / "manifest.json").read_text())["status"] == (
-        "incomplete"
+        "complete"
     )
     assert json.loads((artifact_dir / "summary.json").read_text())["status"] == (
-        "incomplete"
+        "complete"
     )
     assert "HTTP 500" in (artifact_dir / "per_request.jsonl").read_text()
     assert "HTTP 500" in (artifact_dir / "failures.jsonl").read_text()

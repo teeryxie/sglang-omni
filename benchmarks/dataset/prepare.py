@@ -24,6 +24,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -62,6 +63,24 @@ DATASETS: dict[str, str] = {
     "videoamme-ci-50": "zhaochenyang20/Video_AMME_ci",
     "socialomni": SOCIALOMNI_DATASET_ID,
 }
+
+
+def _write_socialomni_manifest(destination: Path) -> None:
+    lines: list[str] = []
+    for path in sorted((destination / "data").rglob("*")):
+        if not path.is_file():
+            continue
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        lines.append(
+            f"{digest.hexdigest()}  {path.relative_to(destination).as_posix()}"
+        )
+    manifest = destination / ".socialomni-files.sha256"
+    temporary = destination / ".socialomni-files.sha256.tmp"
+    temporary.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+    temporary.replace(manifest)
 
 
 def download_dataset(
@@ -116,6 +135,7 @@ def download_dataset(
             + "\n",
             encoding="utf-8",
         )
+        _write_socialomni_manifest(destination)
     elif dataset_id == "MMMU/MMMU":
         config_names = get_dataset_config_names(dataset_id, **revision_kwargs)
         for config_name in config_names:

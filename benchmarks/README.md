@@ -215,7 +215,10 @@ materialized directory. The company JuiceFS (JFS) snapshot directory
 `7e88c7e1afed65eb6fda17aac76bebbe2da57ec7` is a separate internal identifier,
 not a public Hugging Face revision. Their Level 1 and Level 2 metadata SHA-256
 content digests (cryptographic file fingerprints) are identical; formal results
-require one of these two identities and the exact pinned metadata digests.
+require one of these two identities, the exact pinned metadata digests, and a
+SHA-256 manifest that names every selected media file. The public downloader
+creates `.socialomni-files.sha256`; the company snapshot uses its read-only
+`.telos-manifest.sha256`.
 
 ```bash
 python -m benchmarks.dataset.prepare \
@@ -271,7 +274,7 @@ every non-empty eligible response. A judge failure makes the run incomplete.
 Each run writes `manifest.json`, `per_request.jsonl`, `judge_scores.jsonl`,
 `failures.jsonl`, and `summary.json` below
 `<output-dir>/<git-commit>/<run-id>/`. `--resume` requires the same `--run-id`
-and reuses only successful stages whose manifest fingerprint exactly matches
+and reuses only completed sample stages whose manifest fingerprint exactly matches
 the code, data identity, sample IDs, model, generation, judge, and execution
 configuration, including the declared server launch command and stable runtime
 identity. Completed per-judge scores are reused independently, while the final
@@ -280,6 +283,13 @@ requests (unscored requests used to stabilize runtime) and one response-format
 preflight (an endpoint compatibility check) per active endpoint. A mismatch is
 rejected. Latency percentiles and throughput are engineering diagnostics for
 upstream acceptance; they are not SocialOmni paper metrics.
+
+A terminal model error, empty response, or unparseable answer remains in the
+fixed benchmark denominator and is not resampled by `--resume`. Only a missing
+sample record makes the model phase incomplete. Judge scoring is stricter: an
+invalid or missing score is persisted and makes the run incomplete. The formal
+environment gate requires exactly eight H20 entries and `sglang==0.5.18` in the
+recorded provenance.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

@@ -84,6 +84,7 @@ class SocialOmniDatasetInfo:
     level2_sha256: str | None
     manifest_file: str | None
     manifest_sha256: str | None
+    manifest_covers_media: bool = False
 
     @property
     def dataset_sha256(self) -> str:
@@ -110,6 +111,7 @@ class SocialOmniDatasetInfo:
             self.version in SOCIALOMNI_SUPPORTED_VERSIONS
             and self.level1_sha256 == SOCIALOMNI_LEVEL1_SHA256
             and self.level2_sha256 == SOCIALOMNI_LEVEL2_SHA256
+            and self.manifest_covers_media
         )
 
 
@@ -119,6 +121,39 @@ def _sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _sha256_manifest_entries(path: Path) -> dict[str, str]:
+    entries: dict[str, str] = {}
+    for line_number, line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), 1
+    ):
+        if not line.strip():
+            continue
+        match = re.fullmatch(r"([0-9a-fA-F]{64})\s+\*?(.+)", line)
+        if match is None:
+            raise ValueError(f"Invalid SHA-256 manifest line at {path}:{line_number}")
+        relative = PurePosixPath(match.group(2))
+        if relative.is_absolute() or any(
+            part in {"", ".", ".."} for part in relative.parts
+        ):
+            raise ValueError(f"Unsafe path in SHA-256 manifest at {path}:{line_number}")
+        entries[relative.as_posix()] = match.group(1).lower()
+    return entries
+
+
+def socialomni_media_manifest_covers(
+    dataset_info: SocialOmniDatasetInfo, media_paths: Sequence[str]
+) -> bool:
+    """Return whether every selected media file is named by the locked manifest."""
+
+    if not dataset_info.manifest_file or not dataset_info.manifest_covers_media:
+        return False
+    manifest = Path(dataset_info.manifest_file).resolve()
+    entries = _sha256_manifest_entries(manifest)
+    manifest_root = manifest.parent
+    covered = {(manifest_root / relative).resolve() for relative in entries}
+    return all(Path(media_path).resolve() in covered for media_path in media_paths)
 
 
 def _candidate_level_dirs(root: Path, level_name: str) -> list[Path]:
@@ -177,7 +212,12 @@ def inspect_socialomni_dataset(
     level2_file = level2_dir / "annotations.json" if level2_dir else None
     telos_manifest = root / ".telos-manifest.sha256"
     revision_marker = root / ".socialomni-revision.json"
-    manifest = telos_manifest if telos_manifest.is_file() else revision_marker
+    public_manifest = root / ".socialomni-files.sha256"
+    manifest = (
+        telos_manifest
+        if telos_manifest.is_file()
+        else public_manifest if public_manifest.is_file() else revision_marker
+    )
     version = root.name
     if revision_marker.is_file():
         marker = _read_json(revision_marker)
@@ -189,6 +229,16 @@ def inspect_socialomni_dataset(
         ):
             raise ValueError(f"Invalid SocialOmni revision marker: {revision_marker}")
         version = marker["revision"].strip()
+    manifest_entries = (
+        _sha256_manifest_entries(manifest)
+        if manifest.is_file() and manifest.suffix == ".sha256"
+        else {}
+    )
+    manifest_media = [
+        path
+        for path in manifest_entries
+        if "/videos/" in f"/{path}" and Path(path).suffix.lower() == ".mp4"
+    ]
     return SocialOmniDatasetInfo(
         root=str(root),
         version=version,
@@ -198,6 +248,7 @@ def inspect_socialomni_dataset(
         level2_sha256=_sha256(level2_file) if level2_file else None,
         manifest_file=str(manifest) if manifest.is_file() else None,
         manifest_sha256=_sha256(manifest) if manifest.is_file() else None,
+        manifest_covers_media=bool(manifest_media),
     )
 
 

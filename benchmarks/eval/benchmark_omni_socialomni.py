@@ -28,6 +28,7 @@ from benchmarks.dataset.socialomni import (
     inspect_socialomni_dataset,
     load_socialomni_level1_samples,
     load_socialomni_level2_samples,
+    socialomni_media_manifest_covers,
 )
 from benchmarks.metrics.socialomni import (
     SOCIALOMNI_JUDGE_NAMES,
@@ -49,7 +50,7 @@ from benchmarks.tasks.socialomni import (
 )
 
 logger = logging.getLogger(__name__)
-RESULT_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 2
 PROTOCOL_VERSION = "socialomni-paper-fixed-prefix-v1"
 
 
@@ -191,6 +192,8 @@ class RunArtifacts:
 
     def judge_result_hook(self, payload: dict[str, Any]) -> None:
         self.append_jsonl(self.judges_path, payload)
+        if payload.get("error"):
+            self.append_jsonl(self.failures_path, payload)
 
 
 def _latest_by_sample(
@@ -207,22 +210,11 @@ def _latest_by_sample(
 
 
 def _level1_reusable(record: dict[str, Any]) -> bool:
-    # A successful but unparseable response is a fixed wrong answer, not a reason
-    # to sample the model again during resume.
-    return bool(record.get("request_completed", record.get("is_success")))
+    return record.get("stage_complete") is True
 
 
 def _level2_reusable(record: dict[str, Any]) -> bool:
-    # Preserve successful unparseable decisions in the strict denominator.
-    if not record.get("when_request_completed", record.get("when_success")):
-        return False
-    if record.get("gold_when") != "YES":
-        return True
-    if "gold_response_request_completed" in record:
-        return bool(record["gold_response_request_completed"])
-    return bool(record.get("gold_response_success")) and bool(
-        str(record.get("gold_response", "")).strip()
-    )
+    return record.get("stage_complete") is True
 
 
 def _judge_reusable(record: dict[str, Any], expected_names: set[str]) -> bool:
@@ -278,38 +270,55 @@ def _reusable_judge_pairs(
     return pairs
 
 
+def _fresh_judge_request_count(
+    records: list[dict[str, Any]],
+    judges: list[JudgeSpec],
+    reusable_pairs: set[tuple[str, str]],
+) -> int:
+    return sum(
+        (str(record["sample_id"]), judge.name) not in reusable_pairs
+        for record in records
+        for judge in judges
+    )
+
+
 def _formal_provenance_complete(provenance: dict[str, Any]) -> bool:
     repository = provenance.get("repository") or {}
     artifacts = provenance.get("artifacts") or {}
     gpu = provenance.get("gpu") or {}
+    gpu_rows = [
+        row for row in str(gpu.get("nvidia_smi_csv") or "").splitlines() if row.strip()
+    ]
     return bool(
         repository.get("commit")
         and repository.get("dirty") is False
         and artifacts.get("declared_model_revision")
         and provenance.get("launch_command")
-        and gpu.get("nvidia_smi_csv")
+        and len(gpu_rows) == 8
+        and all("H20" in row for row in gpu_rows)
+        and (provenance.get("packages") or {}).get("sglang") == "0.5.18"
     )
 
 
 def _completion_report(
     expected_ids: list[str],
     records: dict[str, dict[str, Any]],
-    is_successful: Callable[[dict[str, Any]], bool],
+    is_complete: Callable[[dict[str, Any]], bool],
 ) -> dict[str, Any]:
     missing = [sample_id for sample_id in expected_ids if sample_id not in records]
-    failed = [
+    incomplete = [
         sample_id
         for sample_id in expected_ids
-        if sample_id in records and not is_successful(records[sample_id])
+        if sample_id in records and not is_complete(records[sample_id])
     ]
-    successful = len(expected_ids) - len(missing) - len(failed)
+    completed = len(expected_ids) - len(missing) - len(incomplete)
     return {
         "expected": len(expected_ids),
         "present": len(expected_ids) - len(missing),
-        "successful": successful,
+        "completed": completed,
         "missing_sample_ids": missing,
-        "failed_sample_ids": failed,
-        "complete": not missing and not failed,
+        "incomplete_sample_ids": incomplete,
+        "complete": not missing and not incomplete,
     }
 
 
@@ -359,6 +368,7 @@ def _contract(
     level2_ids: list[str],
     judges: list[JudgeSpec],
     provenance: dict[str, Any],
+    media_manifest_verified: bool = False,
 ) -> dict[str, Any]:
     return {
         "repository_commit": (provenance.get("repository") or {}).get("commit"),
@@ -367,6 +377,7 @@ def _contract(
         "model_revision": config.model_revision,
         "base_url": config.base_url.rstrip("/"),
         "dataset": asdict(dataset_info),
+        "selected_media_manifest_verified": media_manifest_verified,
         "level": config.level,
         "dataset_view": config.dataset_view,
         "mini": config.mini,
@@ -490,6 +501,10 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         )
         for judge in judges
     ]
+    selected_media_manifest_verified = socialomni_media_manifest_covers(
+        dataset_info,
+        [sample.video_path for sample in [*level1_samples, *level2_samples]],
+    )
 
     provenance = collect_benchmark_provenance(
         model_id=config.model,
@@ -511,6 +526,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         level2_ids=[sample.sample_id for sample in level2_samples],
         judges=judges,
         provenance=provenance,
+        media_manifest_verified=selected_media_manifest_verified,
     )
     run_id = config.run_id or (
         f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{uuid.uuid4().hex[:8]}"
@@ -625,6 +641,9 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 and str(record.get("gold_response", "")).strip()
                 and str(record["sample_id"]) not in reusable_judges
             ]
+            fresh_judge_request_count = _fresh_judge_request_count(
+                judge_pending, judges, reusable_pairs
+            )
             if judge_pending:
                 pending_ids = {str(record["sample_id"]) for record in judge_pending}
                 judges_to_run = [
@@ -682,7 +701,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                         len(fresh_model), model_phase_wall
                     ),
                     "fresh_judge_phase": _wall_speed(
-                        len(judge_pending) * len(judges), judge_phase_wall
+                        fresh_judge_request_count, judge_phase_wall
                     ),
                 },
             }
@@ -714,7 +733,9 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             provenance["repository"]["commit"]
             and provenance["repository"]["dirty"] is False
         )
-        pinned_dataset = dataset_info.is_paper_snapshot
+        pinned_dataset = (
+            dataset_info.is_paper_snapshot and selected_media_manifest_verified
+        )
         reproducible_provenance = _formal_provenance_complete(provenance)
         all_records_complete = all(phase["complete"] for phase in completion.values())
         run_status = "complete" if all_records_complete else "incomplete"
@@ -722,6 +743,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         summary["completion"] = completion
         summary["clean_repository_commit"] = clean_commit
         summary["paper_dataset_snapshot_verified"] = pinned_dataset
+        summary["selected_media_manifest_verified"] = selected_media_manifest_verified
         summary["reproducible_provenance_complete"] = reproducible_provenance
         summary["formal_evaluation_complete"] = (
             formal_level1
