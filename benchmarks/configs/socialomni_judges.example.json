@@ -1,0 +1,31 @@
+{
+  "judges": [
+    {
+      "name": "gpt-4o",
+      "model": "gpt-4o",
+      "base_url": "https://openai-compatible.example/v1",
+      "api_key_env": "SOCIALOMNI_GPT4O_API_KEY",
+      "max_concurrency": 4,
+      "model_family": "openai",
+      "video_input": "none"
+    },
+    {
+      "name": "gemini-2.5-pro",
+      "model": "gemini-2.5-pro",
+      "base_url": "https://openai-compatible.example/v1",
+      "api_key_env": "SOCIALOMNI_GEMINI_API_KEY",
+      "max_concurrency": 4,
+      "model_family": "google",
+      "video_input": "none"
+    },
+    {
+      "name": "qwen3-omni",
+      "model": "qwen3-omni",
+      "base_url": "http://localhost:8000/v1",
+      "api_key_env": null,
+      "max_concurrency": 1,
+      "model_family": "qwen",
+      "video_input": "server-path"
+    }
+  ]
+}
