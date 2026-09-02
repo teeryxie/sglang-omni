@@ -151,6 +151,9 @@ def test_level2_computes_decision_and_quality_metrics() -> None:
     assert quality["empty_or_failed_positive_responses"] == 1
     assert result["per_judge"]["gpt-4o"]["qgold"] == pytest.approx(125 / 3)
     assert result["leave_one_out"]["gpt-4o"]["qens"] == pytest.approx(62.5)
+    assert result["leave_one_out"]["gpt-4o"]["delta_from_complete"][
+        "qens"
+    ] == pytest.approx(-12.5)
 
 
 @pytest.mark.parametrize(
@@ -269,6 +272,7 @@ def test_level2_reports_pairwise_and_family_removal() -> None:
     assert removed["removed_judges"] == ["qwen3-omni"]
     assert removed["remaining_judges"] == ["gpt-4o", "gemini-2.5-pro"]
     assert removed["metrics"]["qgold"] == pytest.approx(275 / 6)
+    assert removed["delta_from_complete"]["qgold"] == pytest.approx(-25 / 6)
 
 
 def test_confidence_intervals_are_bounded_and_bootstrap_is_deterministic() -> None:

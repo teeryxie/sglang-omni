@@ -328,6 +328,22 @@ def _judge_subset_metrics(
     }
 
 
+def _quality_delta(
+    subset: Mapping[str, float | int | None],
+    complete: Mapping[str, float | int | None],
+) -> dict[str, float | None]:
+    deltas: dict[str, float | None] = {}
+    for name in ("qgold", "qens", "qens_joint"):
+        subset_value = subset.get(name)
+        complete_value = complete.get(name)
+        deltas[name] = (
+            float(subset_value) - float(complete_value)
+            if subset_value is not None and complete_value is not None
+            else None
+        )
+    return deltas
+
+
 def compute_socialomni_level2_metrics(
     records: Iterable[object],
     *,
@@ -469,14 +485,17 @@ def compute_socialomni_level2_metrics(
             "qens": _average(judge_qens),
         }
 
-    leave_one_out = {
-        omitted: _judge_subset_metrics(
+    leave_one_out: dict[str, dict[str, Any]] = {}
+    for omitted in judges:
+        subset = _judge_subset_metrics(
             quality_rows,
             [judge for judge in judges if judge != omitted],
             positive_total,
         )
-        for omitted in judges
-    }
+        leave_one_out[omitted] = {
+            **subset,
+            "delta_from_complete": _quality_delta(subset, quality),
+        }
 
     pairwise: dict[str, dict[str, float | int | None]] = {}
     for left, right in combinations(judges, 2):
@@ -494,15 +513,19 @@ def compute_socialomni_level2_metrics(
             remaining = [
                 judge for judge in judges if judge_model_families[judge] != family
             ]
+            subset = (
+                _judge_subset_metrics(quality_rows, remaining, positive_total)
+                if remaining
+                else None
+            )
             family_removal[family] = {
                 "removed_judges": [
                     judge for judge in judges if judge_model_families[judge] == family
                 ],
                 "remaining_judges": remaining,
-                "metrics": (
-                    _judge_subset_metrics(quality_rows, remaining, positive_total)
-                    if remaining
-                    else None
+                "metrics": subset,
+                "delta_from_complete": (
+                    _quality_delta(subset, quality) if subset is not None else None
                 ),
             }
 
