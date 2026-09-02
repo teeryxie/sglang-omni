@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import logging
 import os
 import random
@@ -113,6 +114,7 @@ def make_video_send_fn(
     video_min_pixels: int | None = None,
     video_max_pixels: int | None = None,
     video_total_pixels: int | None = None,
+    use_audio_in_video: bool = False,
     enable_audio_input: bool = False,
     audio_output_dir: str | None = None,
     fixed_prompt: str | None = None,
@@ -153,12 +155,17 @@ def make_video_send_fn(
             payload["video_max_pixels"] = video_max_pixels
         if video_total_pixels is not None:
             payload["video_total_pixels"] = video_total_pixels
+        if use_audio_in_video:
+            payload["use_audio_in_video"] = True
 
         start_time = time.perf_counter()
         try:
             async with session.post(api_url, json=payload) as response:
-                response.raise_for_status()
-                body = await response.json()
+                response_text = await response.text()
+                if response.status >= 400:
+                    result.error = f"HTTP {response.status}: {response_text[:2000]}"
+                    return result
+                body = json.loads(response_text)
 
             if not _apply_chat_completion_response(
                 result,
@@ -174,7 +181,7 @@ def make_video_send_fn(
                 result.rtf = elapsed / result.audio_duration_s
             if result.completion_tokens > 0 and result.engine_time_s > 0:
                 result.tok_per_s = result.completion_tokens / result.engine_time_s
-        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        except (aiohttp.ClientError, asyncio.TimeoutError, json.JSONDecodeError) as exc:
             result.error = str(exc)
         finally:
             result.latency_s = time.perf_counter() - start_time
