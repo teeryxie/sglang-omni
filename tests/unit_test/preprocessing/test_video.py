@@ -71,7 +71,8 @@ def test_extract_audio_from_path_surfaces_decode_failure(monkeypatch) -> None:
         def __exit__(self, *_args):
             return None
 
-        def decode(self, **_kwargs):
+        def decode(self, *, audio):
+            assert audio == 0
             raise RuntimeError("broken stream")
 
     monkeypatch.setattr(video.av, "open", lambda _path: Container())
