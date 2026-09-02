@@ -8,9 +8,17 @@ from pathlib import Path
 
 import pytest
 
+import benchmarks.eval.benchmark_omni_socialomni as socialomni_benchmark
 import benchmarks.tasks.socialomni as socialomni_tasks
-from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLevel2Sample
-from benchmarks.eval.benchmark_omni_socialomni import RunArtifacts
+from benchmarks.dataset.socialomni import (
+    SocialOmniDatasetInfo,
+    SocialOmniLevel1Sample,
+    SocialOmniLevel2Sample,
+)
+from benchmarks.eval.benchmark_omni_socialomni import (
+    RunArtifacts,
+    SocialOmniEvalConfig,
+)
 from benchmarks.tasks.socialomni import (
     ChatResult,
     JudgeSpec,
@@ -366,6 +374,228 @@ def test_resume_requires_identical_manifest(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="fingerprint"):
         artifacts.prepare({"model": "two"}, {"repository": {}}, resume=True)
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        ({}, True),
+        ({"when_success": False}, False),
+        ({"predicted_when": ""}, False),
+        ({"gold_response_success": False}, False),
+        ({"gold_response": ""}, False),
+        (
+            {
+                "gold_when": "NO",
+                "gold_response_success": None,
+                "gold_response": "",
+            },
+            True,
+        ),
+    ],
+)
+def test_level2_resume_only_reuses_complete_model_results(
+    overrides: dict, expected: bool
+) -> None:
+    record = {
+        "gold_when": "YES",
+        "predicted_when": "YES",
+        "when_success": True,
+        "gold_response": "candidate",
+        "gold_response_success": True,
+    }
+    record.update(overrides)
+
+    assert socialomni_benchmark._level2_reusable(record) is expected
+
+
+def test_judge_resume_requires_scores_and_details_from_all_three_judges() -> None:
+    judge_names = {"gpt-4o", "gemini-2.5-pro", "qwen3-omni"}
+    complete = {
+        "gold_judge_scores": {name: 75 for name in judge_names},
+        "judge_details": {name: {"raw_response": "75"} for name in judge_names},
+    }
+    missing_detail = {
+        **complete,
+        "judge_details": {"gpt-4o": {"raw_response": "75"}},
+    }
+    invalid_score = {
+        **complete,
+        "gold_judge_scores": {**complete["gold_judge_scores"], "gpt-4o": 80},
+    }
+
+    assert socialomni_benchmark._judge_reusable(complete, judge_names) is True
+    assert socialomni_benchmark._judge_reusable(missing_detail, judge_names) is False
+    assert socialomni_benchmark._judge_reusable(invalid_score, judge_names) is False
+
+
+def test_failed_model_result_makes_run_incomplete_and_preserves_artifacts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sample = _level1(tmp_path / "video.mp4")
+    dataset_info = SocialOmniDatasetInfo(
+        root=str(tmp_path),
+        version="test-revision",
+        level1_file="dataset.json",
+        level1_sha256="dataset-sha",
+        level2_file=None,
+        level2_sha256=None,
+        manifest_file=None,
+        manifest_sha256=None,
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark, "inspect_socialomni_dataset", lambda _root: dataset_info
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "load_socialomni_level1_samples",
+        lambda *_args, **_kwargs: [sample],
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "collect_benchmark_provenance",
+        lambda **_kwargs: {
+            "repository": {"commit": "abc123", "dirty": False},
+        },
+    )
+
+    async def successful_preflight(_config: SocialOmniEvalConfig) -> None:
+        return None
+
+    async def failed_phase(_samples, **kwargs):
+        record = {
+            "record_type": "result",
+            "phase": "level1",
+            "sample_id": sample.sample_id,
+            "gold_answer": sample.answer,
+            "predicted_answer": "",
+            "visibility": sample.visibility,
+            "is_success": False,
+            "latency_s": 0.1,
+            "error": "HTTP 500: internal error",
+        }
+        kwargs["result_hook"](record)
+        return [record]
+
+    monkeypatch.setattr(socialomni_benchmark, "_preflight_main", successful_preflight)
+    monkeypatch.setattr(socialomni_benchmark, "run_level1_model_phase", failed_phase)
+    config = SocialOmniEvalConfig(
+        dataset_root=str(tmp_path),
+        model="model",
+        level="level1",
+        mini=True,
+        output_dir=str(tmp_path / "results"),
+        run_id="failed-run",
+        bootstrap_samples=10,
+    )
+
+    result = asyncio.run(socialomni_benchmark.run_socialomni(config))
+
+    artifact_dir = tmp_path / "results" / "abc123" / "failed-run"
+    assert result["status"] == "incomplete"
+    assert result["formal_evaluation_complete"] is False
+    assert result["completion"]["level1_model"] == {
+        "expected": 1,
+        "present": 1,
+        "successful": 0,
+        "missing_sample_ids": [],
+        "failed_sample_ids": ["l1"],
+        "complete": False,
+    }
+    assert json.loads((artifact_dir / "manifest.json").read_text())["status"] == (
+        "incomplete"
+    )
+    assert json.loads((artifact_dir / "summary.json").read_text())["status"] == (
+        "incomplete"
+    )
+    assert "HTTP 500" in (artifact_dir / "per_request.jsonl").read_text()
+    assert "HTTP 500" in (artifact_dir / "failures.jsonl").read_text()
+
+
+def test_missing_model_result_marks_artifacts_incomplete(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sample = _level1(tmp_path / "video.mp4")
+    dataset_info = SocialOmniDatasetInfo(
+        root=str(tmp_path),
+        version="test-revision",
+        level1_file="dataset.json",
+        level1_sha256="dataset-sha",
+        level2_file=None,
+        level2_sha256=None,
+        manifest_file=None,
+        manifest_sha256=None,
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark, "inspect_socialomni_dataset", lambda _root: dataset_info
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "load_socialomni_level1_samples",
+        lambda *_args, **_kwargs: [sample],
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "collect_benchmark_provenance",
+        lambda **_kwargs: {
+            "repository": {"commit": "abc123", "dirty": False},
+        },
+    )
+
+    async def successful_preflight(_config: SocialOmniEvalConfig) -> None:
+        return None
+
+    async def empty_phase(_samples, **_kwargs):
+        return []
+
+    monkeypatch.setattr(socialomni_benchmark, "_preflight_main", successful_preflight)
+    monkeypatch.setattr(socialomni_benchmark, "run_level1_model_phase", empty_phase)
+    config = SocialOmniEvalConfig(
+        dataset_root=str(tmp_path),
+        model="model",
+        level="level1",
+        mini=True,
+        output_dir=str(tmp_path / "results"),
+        run_id="missing-run",
+        bootstrap_samples=10,
+    )
+
+    with pytest.raises(RuntimeError, match="missing result records"):
+        asyncio.run(socialomni_benchmark.run_socialomni(config))
+
+    artifact_dir = tmp_path / "results" / "abc123" / "missing-run"
+    assert json.loads((artifact_dir / "manifest.json").read_text())["status"] == (
+        "incomplete"
+    )
+    assert json.loads((artifact_dir / "summary.json").read_text())["status"] == (
+        "incomplete"
+    )
+
+
+def test_main_exits_nonzero_for_incomplete_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SocialOmniEvalConfig(dataset_root="dataset", model="model")
+
+    class Parser:
+        def parse_args(self):
+            return type("Args", (), {})()
+
+    args = Parser().parse_args()
+    args.__dict__.update(config.__dict__)
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "_parser",
+        lambda: type("Parser", (), {"parse_args": lambda self: args})(),
+    )
+
+    async def incomplete_run(_config: SocialOmniEvalConfig) -> dict:
+        return {"status": "incomplete"}
+
+    monkeypatch.setattr(socialomni_benchmark, "run_socialomni", incomplete_run)
+
+    with pytest.raises(SystemExit, match="1"):
+        socialomni_benchmark.main()
 
 
 def test_ffmpeg_command_reencodes_instead_of_stream_copy(tmp_path: Path) -> None:

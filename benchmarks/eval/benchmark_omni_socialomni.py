@@ -12,6 +12,7 @@ import os
 import sys
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,7 @@ from benchmarks.dataset.socialomni import (
 )
 from benchmarks.metrics.socialomni import (
     SOCIALOMNI_JUDGE_NAMES,
+    SOCIALOMNI_SCORE_BUCKETS,
     compute_socialomni_level1_metrics,
     compute_socialomni_level2_metrics,
 )
@@ -203,13 +205,59 @@ def _latest_by_sample(
 
 
 def _level1_reusable(record: dict[str, Any]) -> bool:
-    return bool(record.get("is_success"))
+    return bool(record.get("is_success")) and record.get("predicted_answer") in {
+        "A",
+        "B",
+        "C",
+        "D",
+    }
 
 
 def _level2_reusable(record: dict[str, Any]) -> bool:
-    if not record.get("when_success"):
+    if not record.get("when_success") or record.get("predicted_when") not in {
+        "YES",
+        "NO",
+    }:
         return False
-    return record.get("gold_when") != "YES" or bool(record.get("gold_response_success"))
+    return record.get("gold_when") != "YES" or (
+        bool(record.get("gold_response_success"))
+        and bool(str(record.get("gold_response", "")).strip())
+    )
+
+
+def _judge_reusable(record: dict[str, Any], expected_names: set[str]) -> bool:
+    scores = record.get("gold_judge_scores")
+    details = record.get("judge_details")
+    if not isinstance(scores, dict) or set(scores) != expected_names:
+        return False
+    if not isinstance(details, dict) or set(details) != expected_names:
+        return False
+    return all(
+        not isinstance(score, bool) and score in SOCIALOMNI_SCORE_BUCKETS
+        for score in scores.values()
+    )
+
+
+def _completion_report(
+    expected_ids: list[str],
+    records: dict[str, dict[str, Any]],
+    is_successful: Callable[[dict[str, Any]], bool],
+) -> dict[str, Any]:
+    missing = [sample_id for sample_id in expected_ids if sample_id not in records]
+    failed = [
+        sample_id
+        for sample_id in expected_ids
+        if sample_id in records and not is_successful(records[sample_id])
+    ]
+    successful = len(expected_ids) - len(missing) - len(failed)
+    return {
+        "expected": len(expected_ids),
+        "present": len(expected_ids) - len(missing),
+        "successful": successful,
+        "missing_sample_ids": missing,
+        "failed_sample_ids": failed,
+        "complete": not missing and not failed,
+    }
 
 
 def _ordered_records(
@@ -395,9 +443,10 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             "schema_version": RESULT_SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
             "run_id": run_id,
-            "status": "complete",
+            "status": "running",
             "artifact_dir": str(artifacts.root),
         }
+        completion: dict[str, dict[str, Any]] = {}
 
         if level1_samples:
             existing = _latest_by_sample(
@@ -426,6 +475,11 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             phase_wall = time.perf_counter() - phase_started
             reusable.update({str(record["sample_id"]): record for record in fresh})
             level1_records = _ordered_records(level1_samples, reusable)
+            completion["level1_model"] = _completion_report(
+                [sample.sample_id for sample in level1_samples],
+                reusable,
+                _level1_reusable,
+            )
             summary["level1"] = {
                 "metrics": compute_socialomni_level1_metrics(level1_records),
                 "speed": {
@@ -467,6 +521,11 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 {str(record["sample_id"]): record for record in fresh_model}
             )
             model_records = _ordered_records(level2_samples, reusable_model)
+            completion["level2_model"] = _completion_report(
+                [sample.sample_id for sample in level2_samples],
+                reusable_model,
+                _level2_reusable,
+            )
 
             existing_judges = _latest_by_sample(
                 RunArtifacts.read_jsonl(artifacts.judges_path), "judge_result"
@@ -475,7 +534,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             reusable_judges = {
                 sample_id: record
                 for sample_id, record in existing_judges.items()
-                if set(record.get("gold_judge_scores", {})) == expected_names
+                if _judge_reusable(record, expected_names)
             }
             judge_pending = [
                 record
@@ -500,6 +559,17 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             judge_phase_wall = time.perf_counter() - judge_phase_started
             reusable_judges.update(
                 {str(record["sample_id"]): record for record in fresh_judges}
+            )
+            required_judge_ids = [
+                str(record["sample_id"])
+                for record in model_records
+                if record.get("gold_when") == "YES"
+                and str(record.get("gold_response", "")).strip()
+            ]
+            completion["level2_judge"] = _completion_report(
+                required_judge_ids,
+                reusable_judges,
+                lambda record: _judge_reusable(record, expected_names),
             )
             merged = merge_judge_records(model_records, list(reusable_judges.values()))
             judge_names = [judge.name for judge in judges]
@@ -552,12 +622,16 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             provenance["repository"]["commit"] is not None
             and provenance["repository"]["dirty"] is False
         )
+        all_records_complete = all(phase["complete"] for phase in completion.values())
+        run_status = "complete" if all_records_complete else "incomplete"
+        summary["status"] = run_status
+        summary["completion"] = completion
         summary["clean_repository_commit"] = clean_commit
         summary["formal_evaluation_complete"] = (
-            formal_level1 and formal_level2 and clean_commit
+            formal_level1 and formal_level2 and clean_commit and all_records_complete
         )
         summary["failures"] = RunArtifacts.read_jsonl(artifacts.failures_path)
-        artifacts.finish(summary, status="complete")
+        artifacts.finish(summary, status=run_status)
         return summary
     except Exception as exc:
         failure = {
@@ -621,6 +695,8 @@ def main() -> None:
     config = SocialOmniEvalConfig(**vars(_parser().parse_args()))
     result = asyncio.run(run_socialomni(config))
     print(json.dumps(result, indent=2, ensure_ascii=False))
+    if result.get("status") != "complete":
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
