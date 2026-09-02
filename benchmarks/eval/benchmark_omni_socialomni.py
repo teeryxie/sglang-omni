@@ -37,6 +37,7 @@ from benchmarks.metrics.socialomni import (
 from benchmarks.runtime_metrics import collect_benchmark_provenance
 from benchmarks.tasks.socialomni import (
     JudgeSpec,
+    _client_session,
     load_judge_config,
     merge_judge_records,
     preflight_endpoint,
@@ -334,7 +335,7 @@ def _contract(
 
 async def _preflight_main(config: SocialOmniEvalConfig) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _client_session(timeout) as session:
         await preflight_endpoint(session, base_url=config.base_url, model=config.model)
 
 
@@ -342,7 +343,7 @@ async def _preflight_judges(
     config: SocialOmniEvalConfig, judges: list[JudgeSpec]
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with _client_session(timeout) as session:
         for judge in judges:
             await preflight_endpoint(
                 session,
