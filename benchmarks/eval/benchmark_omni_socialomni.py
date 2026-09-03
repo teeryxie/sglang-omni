@@ -26,6 +26,7 @@ from benchmarks.dataset.socialomni import (
 from benchmarks.metrics.performance import compute_speed_metrics
 from benchmarks.metrics.socialomni import (
     SOCIALOMNI_JUDGE_NAMES,
+    SOCIALOMNI_SCORE_BUCKETS,
     compute_socialomni_level1_metrics,
     compute_socialomni_level2_metrics,
     compute_socialomni_when_metrics,
@@ -37,6 +38,7 @@ from benchmarks.tasks.socialomni import (
     parse_choice,
     run_judges,
     run_level2_model,
+    validate_judge_credentials,
 )
 
 
@@ -66,8 +68,21 @@ def _request_failure(result: object, phase: str) -> dict[str, str] | None:
 
 
 def _judges_complete(records: list[dict[str, Any]], configured: bool) -> bool:
+    required = set(SOCIALOMNI_JUDGE_NAMES)
+
+    def has_all_scores(record: dict[str, Any]) -> bool:
+        scores = record["gold_judge_scores"]
+        return (
+            isinstance(scores, dict)
+            and set(scores) == required
+            and all(
+                type(score) is int and score in SOCIALOMNI_SCORE_BUCKETS
+                for score in scores.values()
+            )
+        )
+
     return configured and all(
-        set(record["gold_judge_scores"]) == set(SOCIALOMNI_JUDGE_NAMES)
+        has_all_scores(record)
         for record in records
         if record["gold_when"] == "YES"
         and record["gold_response_success"]
@@ -79,6 +94,12 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     if config.max_concurrency < 1:
         raise ValueError("max_concurrency must be >= 1")
     levels = ("level1", "level2") if config.level == "both" else (config.level,)
+    judges = (
+        load_judge_config(config.judge_config)
+        if "level2" in levels and config.judge_config
+        else []
+    )
+    validate_judge_credentials(judges)
     dataset_identity = inspect_socialomni_dataset(config.dataset_root, levels)
     provenance = collect_benchmark_provenance(
         model_id=config.model,
@@ -185,7 +206,6 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             if failure:
                 output["failures"].append(failure)
 
-        judges = load_judge_config(config.judge_config) if config.judge_config else []
         output["config"]["judges"] = [judge.public_dict() for judge in judges]
         judge_requests = []
         judge_failures: list[dict[str, str]] = []

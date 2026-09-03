@@ -27,7 +27,7 @@ from benchmarks.metrics.socialomni import (
     SOCIALOMNI_SCORE_BUCKETS,
 )
 
-RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+RETRYABLE_STATUS = frozenset({408, 429})
 PREFIX_ENCODING = {
     "video_codec": "libx264",
     "preset": "fast",
@@ -36,6 +36,7 @@ PREFIX_ENCODING = {
     "audio_bitrate": "192k",
 }
 JUDGE_MAX_TOKENS = 4096
+JUDGE_PARSE_ATTEMPTS = 3
 
 
 @dataclass(frozen=True)
@@ -106,6 +107,15 @@ def _headers(api_key_env: str | None) -> dict[str, str]:
     return headers
 
 
+def validate_judge_credentials(judges: Sequence[JudgeSpec]) -> None:
+    """Fail before model inference when a configured judge credential is absent."""
+    for judge in judges:
+        if judge.api_key_env and not os.environ.get(judge.api_key_env):
+            raise RuntimeError(
+                f"API key environment variable is not set: {judge.api_key_env}"
+            )
+
+
 def _response_text(body: dict[str, Any]) -> str:
     choices = body.get("choices")
     if not isinstance(choices, list) or not choices:
@@ -151,7 +161,10 @@ async def request_chat_completion(
                         latency_s=time.perf_counter() - request_started,
                         error=f"HTTP {response.status}: {raw[:2000]}",
                     )
-                    retry = response.status in RETRYABLE_STATUS
+                    retry = (
+                        response.status in RETRYABLE_STATUS
+                        or 500 <= response.status < 600
+                    )
                 else:
                     try:
                         body = json.loads(raw)
@@ -531,20 +544,40 @@ async def run_judges(
             record, judge = job
             sample = by_id[str(record["sample_id"])]
             async with semaphores[judge.name]:
-                result = await request_chat_completion(
-                    session,
-                    api_url=chat_completions_url(judge.base_url),
-                    payload=judge_payload(
-                        judge,
-                        build_judge_prompt(sample, str(record["gold_response"])),
-                    ),
-                    request_id=f"{sample.sample_id}:judge:{judge.name}",
-                    api_key_env=judge.api_key_env,
-                )
-            score = parse_judge_score(result.text) if result.is_success else None
+                total_latency = 0.0
+                total_prompt_tokens = 0
+                total_completion_tokens = 0
+                score = None
+                for attempt in range(JUDGE_PARSE_ATTEMPTS):
+                    result = await request_chat_completion(
+                        session,
+                        api_url=chat_completions_url(judge.base_url),
+                        payload=judge_payload(
+                            judge,
+                            build_judge_prompt(sample, str(record["gold_response"])),
+                        ),
+                        request_id=f"{sample.sample_id}:judge:{judge.name}",
+                        api_key_env=judge.api_key_env,
+                    )
+                    total_latency += result.latency_s
+                    total_prompt_tokens += result.prompt_tokens
+                    total_completion_tokens += result.completion_tokens
+                    if not result.is_success:
+                        break
+                    score = parse_judge_score(result.text)
+                    if score in SOCIALOMNI_SCORE_BUCKETS:
+                        break
+                    if attempt + 1 < JUDGE_PARSE_ATTEMPTS:
+                        await asyncio.sleep(2**attempt)
+                result.latency_s = total_latency
+                result.prompt_tokens = total_prompt_tokens
+                result.completion_tokens = total_completion_tokens
             if score not in SOCIALOMNI_SCORE_BUCKETS:
                 result.is_success = False
-                result.error = result.error or f"invalid judge score: {result.text!r}"
+                result.error = result.error or (
+                    f"invalid judge score after {JUDGE_PARSE_ATTEMPTS} attempts: "
+                    f"{result.text!r}"
+                )
             return record, judge.name, score, result
 
         outcomes = await bounded_map(

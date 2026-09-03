@@ -161,7 +161,7 @@ python -m benchmarks.eval.benchmark_omni_socialomni \
     --level both \
     --judge-config benchmarks/configs/socialomni_judges.example.json
 
-# 8a. Offline UTMOS (naturalness MOS prediction) scoring on existing output
+# 10a. Offline UTMOS (naturalness MOS prediction) scoring on existing output
 # For custom TTS models (e.g. S2-Pro, Voxtral, Higgs TTS):
 python -m benchmarks.eval.benchmark_tts_seedtts \
     --utmos-only --output-dir results/s2pro_en --device cuda:0
@@ -170,7 +170,7 @@ python -m benchmarks.eval.benchmark_tts_seedtts \
 python -m benchmarks.eval.benchmark_omni_seedtts \
     --utmos-only --output-dir results/qwen3_omni_en --device cuda:0
 
-# 8b. Offline Speaker Similarity (voice resemblance) scoring on existing output
+# 10b. Offline Speaker Similarity (voice resemblance) scoring on existing output
 # For custom TTS models (e.g. S2-Pro, Voxtral, Higgs TTS):
 python -m benchmarks.eval.benchmark_tts_seedtts \
     --similarity-only --output-dir results/s2pro_en --device cuda:0
@@ -258,7 +258,8 @@ fixed denominator. An invalid or missing judge score makes the run incomplete;
 the benchmark never substitutes a two-judge mean. Latency percentiles and
 throughput are engineering diagnostics, not SocialOmni paper metrics.
 The result `status` covers the requested run (including mini runs), while
-`formal_status` is complete only for a clean, full-size run on verified data.
+`formal_status` is complete only for a clean, full-size run whose metadata
+matches the pinned public dataset revision.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

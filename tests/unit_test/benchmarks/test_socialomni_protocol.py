@@ -12,6 +12,7 @@ from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLeve
 from benchmarks.eval import benchmark_omni_socialomni as entrypoint
 from benchmarks.tasks.socialomni import (
     JUDGE_MAX_TOKENS,
+    JUDGE_PARSE_ATTEMPTS,
     JudgeSpec,
     bounded_map,
     build_ffmpeg_prefix_command,
@@ -49,6 +50,24 @@ def _level2(index: int = 0) -> SocialOmniLevel2Sample:
         "private reference response",
         "private reference transcript",
     )
+
+
+def _config(**overrides) -> entrypoint.SocialOmniEvalConfig:
+    values = {
+        "dataset_root": ".",
+        "model": "qwen3-omni",
+        "base_url": "http://localhost:8000",
+        "level": "level1",
+        "judge_config": None,
+        "prefix_cache_dir": "cache",
+        "mini": False,
+        "max_samples": None,
+        "max_concurrency": 1,
+        "timeout_s": 30,
+        "output_dir": "results",
+    }
+    values.update(overrides)
+    return entrypoint.SocialOmniEvalConfig(**values)
 
 
 def test_model_prompts_do_not_leak_reference_material() -> None:
@@ -183,10 +202,11 @@ async def test_http_error_body_is_preserved() -> None:
     assert "specific failure body" in result.error
 
 
+@pytest.mark.parametrize("status", [429, 501, 507])
 @pytest.mark.asyncio
-async def test_retryable_http_error_is_retried(monkeypatch) -> None:
+async def test_retryable_http_error_is_retried(monkeypatch, status: int) -> None:
     session = _Session(
-        _Response(429, "retry"),
+        _Response(status, "retry"),
         _Response(
             200,
             json.dumps({"choices": [{"message": {"content": "Answer: A"}}]}),
@@ -205,6 +225,19 @@ async def test_retryable_http_error_is_retried(monkeypatch) -> None:
     )
     assert result.is_success
     assert session.calls == 2
+
+
+@pytest.mark.asyncio
+async def test_non_retryable_http_error_is_not_retried() -> None:
+    session = _Session(_Response(400, "bad request"))
+    result = await request_chat_completion(
+        session,  # type: ignore[arg-type]
+        api_url="http://example/v1/chat/completions",
+        payload={},
+        request_id="request",
+    )
+    assert not result.is_success
+    assert session.calls == 1
 
 
 @pytest.mark.asyncio
@@ -273,7 +306,11 @@ async def test_judges_preserve_invalid_raw_score_and_error(monkeypatch) -> None:
     }
     judges = [JudgeSpec("gpt-4o", "gpt-4o", "http://localhost:8000", None, 1)]
 
+    calls = 0
+
     async def fake_request(*_args, request_id: str, **_kwargs):
+        nonlocal calls
+        calls += 1
         return RequestResult(request_id=request_id, text="Score: 80", is_success=True)
 
     monkeypatch.setattr(
@@ -286,6 +323,46 @@ async def test_judges_preserve_invalid_raw_score_and_error(monkeypatch) -> None:
     assert result["raw_response"] == "Score: 80"
     assert result["is_success"] is False
     assert "invalid judge score" in result["error"]
+    assert calls == JUDGE_PARSE_ATTEMPTS
+
+
+@pytest.mark.asyncio
+async def test_judge_parse_retry_stops_after_valid_score(monkeypatch) -> None:
+    sample = _level2()
+    record = {
+        "sample_id": sample.sample_id,
+        "gold_when": "YES",
+        "gold_response": "candidate",
+        "gold_response_success": True,
+        "gold_judge_scores": {},
+        "judge_results": {},
+    }
+    judges = [JudgeSpec("gpt-4o", "gpt-4o", "http://localhost:8000", None, 1)]
+    responses = iter(("not a score", "75"))
+
+    async def fake_request(*_args, request_id: str, **_kwargs):
+        return RequestResult(
+            request_id=request_id,
+            text=next(responses),
+            is_success=True,
+            latency_s=0.1,
+            prompt_tokens=2,
+            completion_tokens=1,
+        )
+
+    async def no_sleep(_seconds: float) -> None:
+        return None
+
+    monkeypatch.setattr(
+        "benchmarks.tasks.socialomni.request_chat_completion", fake_request
+    )
+    monkeypatch.setattr("benchmarks.tasks.socialomni.asyncio.sleep", no_sleep)
+    results, failures = await run_judges([sample], [record], judges, timeout_s=30)
+    assert not failures
+    assert record["gold_judge_scores"] == {"gpt-4o": 75}
+    assert results[0].latency_s == pytest.approx(0.2)
+    assert results[0].prompt_tokens == 4
+    assert results[0].completion_tokens == 2
 
 
 def test_prefix_command_reencodes_video_and_audio(tmp_path: Path) -> None:
@@ -391,6 +468,96 @@ async def test_level2_automatically_derives_first_200_view(monkeypatch) -> None:
     assert result["summary"]["formal_status"] == "incomplete"
 
 
+@pytest.mark.asyncio
+async def test_invalid_judge_config_fails_before_level2_requests(
+    tmp_path: Path, monkeypatch
+) -> None:
+    config_path = tmp_path / "judges.json"
+    config_path.write_text('{"judges": []}', encoding="utf-8")
+    called = False
+
+    async def fake_model(*_args, **_kwargs):
+        nonlocal called
+        called = True
+        return [], []
+
+    monkeypatch.setattr(entrypoint, "run_level2_model", fake_model)
+    config = _config(level="level2", judge_config=str(config_path))
+    with pytest.raises(ValueError, match="exactly three judges"):
+        await entrypoint.run_socialomni(config)
+    assert not called
+
+
+@pytest.mark.parametrize(
+    ("sample_count", "mini", "dirty", "metadata_matches", "expected"),
+    [
+        (2_000, False, False, True, "complete"),
+        (2_000, False, True, True, "incomplete"),
+        (2_000, False, False, False, "incomplete"),
+        (2, True, False, True, "incomplete"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_formal_status_requires_clean_repository_and_expected_metadata(
+    monkeypatch,
+    sample_count: int,
+    mini: bool,
+    dirty: bool,
+    metadata_matches: bool,
+    expected: str,
+) -> None:
+    samples = [
+        SocialOmniLevel1Sample(
+            str(index),
+            "/tmp/video.mp4",
+            "Who?",
+            ("one", "two", "three", "four"),
+            "A",
+            "speaker_visible" if index else "visibility_mismatch",
+        )
+        for index in range(sample_count)
+    ]
+
+    class FakeRunner:
+        wall_clock_s = 1.0
+
+        def __init__(self, _config):
+            pass
+
+        async def run(self, current_samples, _send):
+            return [
+                RequestResult(
+                    request_id=sample.sample_id,
+                    text="Answer: A",
+                    is_success=True,
+                )
+                for sample in current_samples
+            ]
+
+    monkeypatch.setattr(entrypoint, "BenchmarkRunner", FakeRunner)
+    monkeypatch.setattr(
+        entrypoint, "load_socialomni_level1_samples", lambda *_a, **_k: samples
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "inspect_socialomni_dataset",
+        lambda *_a, **_k: {
+            "expected_huggingface_revision": "revision",
+            "metadata_sha256": {},
+            "evaluation_input_sha256": "digest",
+            "metadata_matches_expected_revision": metadata_matches,
+        },
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "collect_benchmark_provenance",
+        lambda **_kwargs: {"repository": {"commit": "abc", "dirty": dirty}},
+    )
+    result = await entrypoint.run_socialomni(_config(mini=mini))
+    assert result["summary"]["status"] == "complete"
+    assert result["summary"]["formal_status"] == expected
+
+
 def test_paper_core_judge_completeness_is_independent() -> None:
     scores = {name: 75 for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")}
     records = [
@@ -405,3 +572,17 @@ def test_paper_core_judge_completeness_is_independent() -> None:
     records[-1]["gold_judge_scores"].pop("gpt-4o")
     assert entrypoint._judges_complete(records[:200], True)
     assert not entrypoint._judges_complete(records, True)
+
+
+def test_invalid_score_is_not_judge_complete() -> None:
+    record = {
+        "gold_when": "YES",
+        "gold_response": "candidate",
+        "gold_response_success": True,
+        "gold_judge_scores": {
+            "gpt-4o": 75,
+            "gemini-2.5-pro": 80,
+            "qwen3-omni": 75,
+        },
+    }
+    assert not entrypoint._judges_complete([record], True)
