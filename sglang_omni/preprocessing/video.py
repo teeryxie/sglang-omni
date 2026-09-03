@@ -164,7 +164,7 @@ async def ensure_video_list_async(
         items = [videos]
     normalized: list[Any] = []
     sample_fps_list: list[float] = []
-    extracted_audios: list[Any] = [] if extract_audio else []
+    extracted_audios: list[Any] = []
     all_paths = True
 
     # Import here to avoid circular dependency
@@ -430,16 +430,3 @@ def compute_video_cache_key(
         f"|min_px={min_pixels}|max_px={max_pixels}|total_px={total_pixels}"
     )
     return base + decode_sig
-
-
-def _check_if_video_has_audio(video_path: str | Path) -> bool:
-    try:
-        container = av.open(str(video_path))
-        audio_streams = [
-            stream for stream in container.streams if stream.type == "audio"
-        ]
-        container.close()
-        return len(audio_streams) > 0
-    except Exception as e:
-        logger.debug(f"Failed to check audio in video {video_path}: {e}")
-        return False
