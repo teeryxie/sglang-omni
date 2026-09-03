@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 from typing import Any
@@ -106,6 +107,7 @@ def create_preprocessing_executor(
     model_path: str,
     *,
     max_concurrency: int = 8,
+    stream_codec_output: bool = True,
 ) -> ThreadedSimpleScheduler:
     del model_path
     # note (luojiaxuan): preprocessing must admit several requests at once. A
@@ -113,7 +115,10 @@ def create_preprocessing_executor(
     # the speech-tokenizer batcher would only ever see batches of one; the
     # default matches the batcher's max_batch_size.
     return ThreadedSimpleScheduler(
-        preprocess_qwen3_tts_payload,
+        functools.partial(
+            preprocess_qwen3_tts_payload,
+            default_stream_codec_output=stream_codec_output,
+        ),
         max_concurrency=max_concurrency,
         abort_callback=cleanup_prepared_qwen3_tts_request,
     )
