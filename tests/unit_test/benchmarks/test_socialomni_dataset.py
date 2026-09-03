@@ -5,7 +5,9 @@ from pathlib import Path
 
 import pytest
 
+from benchmarks.dataset import socialomni
 from benchmarks.dataset.socialomni import (
+    inspect_socialomni_dataset,
     load_socialomni_level1_samples,
     load_socialomni_level2_samples,
     parse_socialomni_timestamp,
@@ -89,6 +91,45 @@ def test_loaders_preserve_nested_paths_and_mini_groups(tmp_path: Path) -> None:
     )
     assert [sample.gold_when for sample in second] == ["YES", "NO"]
     assert second[0].timestamp_s == 3.25
+
+
+def test_inspect_dataset_matches_expected_metadata_hashes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    level1 = tmp_path / "data" / "level_1" / "dataset.json"
+    level2 = tmp_path / "data" / "level_2" / "annotations.json"
+    _write(level1, [])
+    _write(level2, {"total_samples": 0, "data": []})
+    expected = {
+        "level1": socialomni._sha256(level1),
+        "level2": socialomni._sha256(level2),
+    }
+    monkeypatch.setattr(socialomni, "SOCIALOMNI_METADATA_SHA256", expected)
+
+    identity = inspect_socialomni_dataset(tmp_path, ("level1", "level2"))
+
+    assert identity["metadata_sha256"] == expected
+    assert identity["metadata_matches_expected_revision"] is True
+
+
+def test_inspect_dataset_rejects_modified_metadata_as_expected_revision(
+    tmp_path: Path, monkeypatch
+) -> None:
+    metadata = tmp_path / "data" / "level_1" / "dataset.json"
+    _write(metadata, [])
+    monkeypatch.setattr(socialomni, "SOCIALOMNI_METADATA_SHA256", {"level1": "0" * 64})
+
+    identity = inspect_socialomni_dataset(tmp_path, ("level1",))
+
+    assert identity["metadata_matches_expected_revision"] is False
+
+
+def test_inspect_dataset_hashes_only_requested_levels(tmp_path: Path) -> None:
+    _write(tmp_path / "data" / "level_1" / "dataset.json", [])
+
+    identity = inspect_socialomni_dataset(tmp_path, ("level1",))
+
+    assert set(identity["metadata_sha256"]) == {"level1"}
 
 
 @pytest.mark.parametrize("video", ["../escape.mp4", "/tmp/escape.mp4", "level_2/x.mp4"])

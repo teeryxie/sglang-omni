@@ -257,6 +257,8 @@ from those same records. A model error or unparseable answer remains in the
 fixed denominator. An invalid or missing judge score makes the run incomplete;
 the benchmark never substitutes a two-judge mean. Latency percentiles and
 throughput are engineering diagnostics, not SocialOmni paper metrics.
+The result `status` covers the requested run (including mini runs), while
+`formal_status` is complete only for a clean, full-size run on verified data.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

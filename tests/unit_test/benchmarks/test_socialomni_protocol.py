@@ -11,6 +11,7 @@ from benchmarks.benchmarker.data import RequestResult
 from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLevel2Sample
 from benchmarks.eval import benchmark_omni_socialomni as entrypoint
 from benchmarks.tasks.socialomni import (
+    JUDGE_MAX_TOKENS,
     JudgeSpec,
     bounded_map,
     build_ffmpeg_prefix_command,
@@ -18,6 +19,7 @@ from benchmarks.tasks.socialomni import (
     build_response_prompt,
     build_when_prompt,
     create_video_prefix,
+    judge_payload,
     load_judge_config,
     model_payload,
     parse_choice,
@@ -66,6 +68,13 @@ def test_model_payload_uses_native_video_with_embedded_audio() -> None:
     assert payload["videos"] == ["/tmp/prefix.mp4"]
     assert payload["use_audio_in_video"] is True
     assert payload["modalities"] == ["text"]
+
+
+def test_judge_payload_allows_reasoning_before_score() -> None:
+    judge = JudgeSpec(
+        "gemini-2.5-pro", "gemini-2.5-pro", "http://localhost:8000", None, 1
+    )
+    assert judge_payload(judge, "prompt")["max_tokens"] == JUDGE_MAX_TOKENS == 4096
 
 
 @pytest.mark.parametrize(
@@ -238,7 +247,45 @@ async def test_judges_preserve_raw_results(monkeypatch) -> None:
     _, failures = await run_judges([sample], [record], judges, timeout_s=30)
     assert not failures
     assert record["gold_judge_scores"] == {name.name: 75 for name in judges}
-    assert record["judge_results"]["gpt-4o"]["text"] == "75"
+    result = record["judge_results"]["gpt-4o"]
+    assert set(result) == {
+        "score",
+        "raw_response",
+        "is_success",
+        "latency_s",
+        "prompt_tokens",
+        "completion_tokens",
+        "error",
+    }
+    assert result["raw_response"] == "75"
+
+
+@pytest.mark.asyncio
+async def test_judges_preserve_invalid_raw_score_and_error(monkeypatch) -> None:
+    sample = _level2()
+    record = {
+        "sample_id": sample.sample_id,
+        "gold_when": "YES",
+        "gold_response": "candidate",
+        "gold_response_success": True,
+        "gold_judge_scores": {},
+        "judge_results": {},
+    }
+    judges = [JudgeSpec("gpt-4o", "gpt-4o", "http://localhost:8000", None, 1)]
+
+    async def fake_request(*_args, request_id: str, **_kwargs):
+        return RequestResult(request_id=request_id, text="Score: 80", is_success=True)
+
+    monkeypatch.setattr(
+        "benchmarks.tasks.socialomni.request_chat_completion", fake_request
+    )
+    _, failures = await run_judges([sample], [record], judges, timeout_s=30)
+    result = record["judge_results"]["gpt-4o"]
+    assert len(failures) == 1
+    assert result["score"] is None
+    assert result["raw_response"] == "Score: 80"
+    assert result["is_success"] is False
+    assert "invalid judge score" in result["error"]
 
 
 def test_prefix_command_reencodes_video_and_audio(tmp_path: Path) -> None:

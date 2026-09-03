@@ -35,6 +35,7 @@ PREFIX_ENCODING = {
     "audio_codec": "aac",
     "audio_bitrate": "192k",
 }
+JUDGE_MAX_TOKENS = 4096
 
 
 @dataclass(frozen=True)
@@ -284,7 +285,7 @@ def judge_payload(judge: JudgeSpec, prompt: str) -> dict[str, Any]:
     return {
         "model": judge.model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 512,
+        "max_tokens": JUDGE_MAX_TOKENS,
         "temperature": 0.0,
         "stream": False,
     }
@@ -554,8 +555,13 @@ async def run_judges(
     for record, judge_name, score, result in outcomes:
         results.append(result)
         record["judge_results"][judge_name] = {
-            **asdict(result),
-            "parsed_score": score,
+            "score": score,
+            "raw_response": result.text,
+            "is_success": result.is_success,
+            "latency_s": result.latency_s,
+            "prompt_tokens": result.prompt_tokens,
+            "completion_tokens": result.completion_tokens,
+            "error": result.error,
         }
         if result.is_success and score is not None:
             record["gold_judge_scores"][judge_name] = score
