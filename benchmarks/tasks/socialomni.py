@@ -1017,8 +1017,9 @@ async def run_level2_judge_phase(
     attempt_hook: AttemptHook | None = None,
     result_hook: RecordHook | None = None,
 ) -> list[dict[str, Any]]:
-    if len(judges) != 3:
-        raise ValueError("formal SocialOmni evaluation requires exactly three judges")
+    judge_names = [judge.name for judge in judges]
+    if not judge_names or len(judge_names) != len(set(judge_names)):
+        raise ValueError("judge collection requires one or more distinct judges")
     timeout = aiohttp.ClientTimeout(total=timeout_s)
     semaphores = {
         judge.name: asyncio.Semaphore(judge.max_concurrency) for judge in judges

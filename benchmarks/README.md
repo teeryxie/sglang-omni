@@ -266,6 +266,28 @@ python -m benchmarks.eval.benchmark_omni_socialomni \
     --prefix-cache-dir /local_nvme/xietianyu/tmp/socialomni-prefixes \
     --run-id level2-all
 
+# Run candidate inference first, then switch services and resume only the
+# fixed three-judge phase. Keep every other argument, including the complete
+# judge configuration, identical so the manifest fingerprint remains stable.
+python -m benchmarks.eval.benchmark_omni_socialomni \
+    --dataset-root /path/to/socialomni --model qwen3-omni-thinking \
+    --level level2 --stage model --dataset-view all \
+    --judge-config /path/to/judges.json --run-id level2-split
+python -m benchmarks.eval.benchmark_omni_socialomni \
+    --dataset-root /path/to/socialomni --model qwen3-omni-thinking \
+    --level level2 --stage judge --dataset-view all \
+    --judge-config /path/to/judges.json --run-id level2-split --resume
+
+# If one judge is temporarily unavailable, append only the available judge's
+# records. This intentionally exits non-zero and does not compute a partial
+# ensemble. Repeat for other judges, then run the unfiltered judge stage above
+# after all three are available to merge the formal result.
+python -m benchmarks.eval.benchmark_omni_socialomni \
+    --dataset-root /path/to/socialomni --model qwen3-omni-thinking \
+    --level level2 --stage judge --judge gemini-2.5-pro \
+    --dataset-view all --judge-config /path/to/judges.json \
+    --run-id level2-split --resume
+
 # Evaluate only the source-order first 200 items used for paper comparison.
 python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \

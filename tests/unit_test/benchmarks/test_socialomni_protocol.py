@@ -251,6 +251,44 @@ def test_judge_phase_enforces_global_request_limit(monkeypatch, tmp_path: Path) 
     assert all(len(result["gold_judge_scores"]) == 3 for result in results)
 
 
+def test_judge_phase_allows_one_fixed_judge(monkeypatch, tmp_path: Path) -> None:
+    async def fake_request(*_args, **kwargs) -> ChatResult:
+        return ChatResult(
+            request_id=kwargs["request_id"],
+            text="75",
+            is_success=True,
+            latency_s=0.001,
+        )
+
+    monkeypatch.setattr(socialomni_tasks, "request_chat_completion", fake_request)
+    sample = _level2(tmp_path / "video.mp4")
+    results = asyncio.run(
+        run_level2_judge_phase(
+            {sample.sample_id: sample},
+            [
+                {
+                    "sample_id": sample.sample_id,
+                    "gold_when": "YES",
+                    "gold_response": "candidate",
+                    "prefix_path": sample.video_path,
+                }
+            ],
+            judges=[
+                JudgeSpec(
+                    name="gemini-2.5-pro",
+                    model="gemini-2.5-pro",
+                    base_url="http://example",
+                )
+            ],
+            max_concurrency=1,
+            max_attempts=1,
+            timeout_s=1,
+        )
+    )
+
+    assert results[0]["gold_judge_scores"] == {"gemini-2.5-pro": 75}
+
+
 def test_judge_phase_reuses_partial_scores(monkeypatch, tmp_path: Path) -> None:
     requested: list[str] = []
     journal: list[dict] = []
@@ -704,6 +742,17 @@ def test_contract_fingerprint_covers_stable_runtime_identity(tmp_path: Path) -> 
         judges=[],
         provenance=provenance,
     )
+    dirty_repository = socialomni_benchmark._contract(
+        config,
+        dataset_info=dataset_info,
+        level1_ids=["one"],
+        level2_ids=[],
+        judges=[],
+        provenance={
+            **provenance,
+            "repository": {"commit": "abc123", "dirty": True},
+        },
+    )
 
     assert RunArtifacts.fingerprint(first) == RunArtifacts.fingerprint(
         dynamic_gpu_change
@@ -714,6 +763,7 @@ def test_contract_fingerprint_covers_stable_runtime_identity(tmp_path: Path) -> 
     assert RunArtifacts.fingerprint(first) != RunArtifacts.fingerprint(
         changed_media_transport
     )
+    assert RunArtifacts.fingerprint(first) != RunArtifacts.fingerprint(dirty_repository)
 
 
 def test_resume_reuses_all_completed_model_decisions() -> None:
@@ -738,6 +788,22 @@ def test_resume_reuses_all_completed_model_decisions() -> None:
             "gold_response": "",
         }
     )
+
+
+def test_resume_rejects_records_with_mismatched_dataset_truth(tmp_path: Path) -> None:
+    level1 = _level1(tmp_path / "level1.mp4")
+    level2 = _level2(tmp_path / "level2.mp4")
+
+    assert socialomni_benchmark._level1_matches_sample(
+        {"gold_answer": level1.answer, "visibility": level1.visibility}, level1
+    )
+    assert not socialomni_benchmark._level1_matches_sample(
+        {"gold_answer": "A", "visibility": level1.visibility}, level1
+    )
+    assert socialomni_benchmark._level2_matches_sample(
+        {"gold_when": level2.gold_when}, level2
+    )
+    assert not socialomni_benchmark._level2_matches_sample({"gold_when": "NO"}, level2)
 
 
 def test_formal_provenance_requires_exact_h20_and_sglang_environment() -> None:
@@ -975,6 +1041,170 @@ def test_missing_model_result_marks_artifacts_incomplete(
     assert json.loads((artifact_dir / "summary.json").read_text())["status"] == (
         "incomplete"
     )
+
+
+def test_level2_model_and_judge_stages_resume_same_run(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sample = _level2(tmp_path / "video.mp4")
+    dataset_info = SocialOmniDatasetInfo(
+        root=str(tmp_path),
+        version="test-revision",
+        level1_file=None,
+        level1_sha256=None,
+        level2_file="annotations.json",
+        level2_sha256="level2-sha",
+        manifest_file=None,
+        manifest_sha256=None,
+    )
+    judges = [
+        JudgeSpec(name=name, model=name, base_url="http://judge.example")
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+    calls = {"main_preflight": 0, "model": 0, "judge_preflight": 0, "judge": 0}
+
+    monkeypatch.setattr(
+        socialomni_benchmark, "inspect_socialomni_dataset", lambda _root: dataset_info
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "load_socialomni_level2_samples",
+        lambda *_args, **_kwargs: [sample],
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "load_judge_config",
+        lambda _path: judges,
+    )
+    monkeypatch.setattr(
+        socialomni_benchmark,
+        "collect_benchmark_provenance",
+        lambda **_kwargs: {
+            "repository": {"commit": "abc123", "dirty": False},
+            "artifacts": {"declared_model_revision": "model-revision"},
+            "host": {"platform": "test"},
+            "gpu": {"nvidia_smi_csv": ""},
+            "packages": {},
+            "dependency_freeze_sha256": "freeze",
+            "launch_command": "serve candidate",
+        },
+    )
+
+    async def fake_prefix(*_args, **_kwargs) -> Path:
+        return tmp_path / "prefix.mp4"
+
+    async def fake_main_preflight(*_args, **_kwargs) -> None:
+        calls["main_preflight"] += 1
+
+    async def fake_model_phase(_samples, **kwargs):
+        calls["model"] += 1
+        record = {
+            "record_type": "result",
+            "phase": "level2_model",
+            "sample_id": sample.sample_id,
+            "gold_when": "YES",
+            "predicted_when": "YES",
+            "when_success": True,
+            "when_latency_s": 0.1,
+            "gold_response": "candidate",
+            "gold_response_success": True,
+            "gold_response_latency_s": 0.2,
+            "selected_response": "candidate",
+            "prefix_path": str(tmp_path / "prefix.mp4"),
+            "stage_complete": True,
+        }
+        kwargs["result_hook"](record)
+        return [record]
+
+    async def fake_judge_preflight(*_args, **_kwargs) -> None:
+        calls["judge_preflight"] += 1
+
+    async def fake_judge_phase(_samples, _records, **kwargs):
+        calls["judge"] += 1
+        active = kwargs["judges"]
+        record = {
+            "record_type": "judge_result",
+            "phase": "level2_judge",
+            "sample_id": sample.sample_id,
+            "gold_judge_scores": {judge.name: 75 for judge in active},
+            "judge_details": {judge.name: {"raw_response": "75"} for judge in active},
+        }
+        kwargs["result_hook"](record)
+        return [record]
+
+    monkeypatch.setattr(socialomni_benchmark, "create_video_prefix", fake_prefix)
+    monkeypatch.setattr(socialomni_benchmark, "_preflight_main", fake_main_preflight)
+    monkeypatch.setattr(
+        socialomni_benchmark, "run_level2_model_phase", fake_model_phase
+    )
+    monkeypatch.setattr(socialomni_benchmark, "_preflight_judges", fake_judge_preflight)
+    monkeypatch.setattr(
+        socialomni_benchmark, "run_level2_judge_phase", fake_judge_phase
+    )
+
+    config = SocialOmniEvalConfig(
+        dataset_root=str(tmp_path),
+        model="candidate",
+        model_revision="model-revision",
+        launch_command="serve candidate",
+        level="level2",
+        stage="model",
+        judge_config="judges.json",
+        mini=True,
+        output_dir=str(tmp_path / "results"),
+        run_id="split-run",
+        bootstrap_samples=10,
+    )
+    model_result = asyncio.run(socialomni_benchmark.run_socialomni(config))
+
+    assert model_result["status"] == "complete"
+    assert model_result["formal_evaluation_complete"] is False
+    assert set(model_result["completion"]) == {"level2_model"}
+    assert calls == {
+        "main_preflight": 1,
+        "model": 1,
+        "judge_preflight": 0,
+        "judge": 0,
+    }
+
+    partial_result = asyncio.run(
+        socialomni_benchmark.run_socialomni(
+            replace(
+                config,
+                stage="judge",
+                judge_names=("gemini-2.5-pro",),
+                resume=True,
+            )
+        )
+    )
+
+    assert partial_result["status"] == "incomplete"
+    assert partial_result["completion"]["level2_judge"]["complete"] is False
+    assert partial_result["level2"]["available_judge_pairs"] == 1
+    assert "selected" not in partial_result["level2"]
+
+    judge_result = asyncio.run(
+        socialomni_benchmark.run_socialomni(replace(config, stage="judge", resume=True))
+    )
+
+    assert judge_result["status"] == "complete"
+    assert set(judge_result["completion"]) == {"level2_model", "level2_judge"}
+    assert judge_result["level2"]["selected"]["quality"]["qgold"] == 75
+    assert calls == {
+        "main_preflight": 1,
+        "model": 1,
+        "judge_preflight": 2,
+        "judge": 2,
+    }
+
+
+def test_judge_stage_rejects_non_level2_run(tmp_path: Path) -> None:
+    config = SocialOmniEvalConfig(
+        dataset_root=str(tmp_path), model="model", level="both", stage="judge"
+    )
+
+    with pytest.raises(ValueError, match="requires --level level2"):
+        asyncio.run(socialomni_benchmark.run_socialomni(config))
 
 
 def test_main_exits_nonzero_for_incomplete_run(

@@ -24,6 +24,7 @@ import aiohttp
 
 from benchmarks.dataset.socialomni import (
     SOCIALOMNI_PAPER_CORE_SIZE,
+    SocialOmniLevel1Sample,
     SocialOmniLevel2Sample,
     inspect_socialomni_dataset,
     load_socialomni_level1_samples,
@@ -71,6 +72,8 @@ class SocialOmniEvalConfig:
     frame_height: int = 128
     frame_jpeg_quality: int = 50
     level: str = "both"
+    stage: str = "all"
+    judge_names: tuple[str, ...] = ()
     dataset_view: str = "all"
     judge_config: str | None = None
     output_dir: str = "results/socialomni"
@@ -228,6 +231,21 @@ def _level2_reusable(record: dict[str, Any]) -> bool:
     return record.get("stage_complete") is True
 
 
+def _level1_matches_sample(
+    record: dict[str, Any], sample: SocialOmniLevel1Sample
+) -> bool:
+    return (
+        record.get("gold_answer") == sample.answer
+        and record.get("visibility") == sample.visibility
+    )
+
+
+def _level2_matches_sample(
+    record: dict[str, Any], sample: SocialOmniLevel2Sample
+) -> bool:
+    return record.get("gold_when") == sample.gold_when
+
+
 def _judge_reusable(record: dict[str, Any], expected_names: set[str]) -> bool:
     scores = record.get("gold_judge_scores")
     details = record.get("judge_details")
@@ -383,6 +401,7 @@ def _contract(
 ) -> dict[str, Any]:
     return {
         "repository_commit": (provenance.get("repository") or {}).get("commit"),
+        "repository_dirty": (provenance.get("repository") or {}).get("dirty"),
         "protocol_version": PROTOCOL_VERSION,
         "model": config.model,
         "model_revision": config.model_revision,
@@ -495,6 +514,12 @@ async def _preflight_judges(
 async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     if config.level not in {"level1", "level2", "both"}:
         raise ValueError("level must be level1, level2, or both")
+    if config.stage not in {"all", "model", "judge"}:
+        raise ValueError("stage must be all, model, or judge")
+    if config.stage == "judge" and config.level != "level2":
+        raise ValueError("judge stage requires --level level2")
+    if config.judge_names and config.stage != "judge":
+        raise ValueError("--judge may only be used with --stage judge")
     if config.dataset_view not in {"all", "paper-core-200"}:
         raise ValueError("dataset_view must be all or paper-core-200")
     if config.max_concurrency < 1 or config.judge_max_concurrency < 1:
@@ -547,6 +572,18 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         )
         for judge in judges
     ]
+    requested_judges = set(config.judge_names)
+    unknown_judges = requested_judges - {judge.name for judge in judges}
+    if unknown_judges:
+        raise ValueError(
+            "--judge names are not present in the fixed judge config: "
+            + ", ".join(sorted(unknown_judges))
+        )
+    active_judges = [
+        judge
+        for judge in judges
+        if not requested_judges or judge.name in requested_judges
+    ]
     selected_media_manifest_verified = socialomni_media_manifest_covers(
         dataset_info,
         [sample.video_path for sample in [*level1_samples, *level2_samples]],
@@ -586,11 +623,13 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     repository_commit = provenance["repository"]["commit"] or "unknown-commit"
     artifacts = RunArtifacts(Path(config.output_dir) / repository_commit[:12] / run_id)
     artifacts.prepare(contract, provenance, resume=config.resume)
+    manifest = json.loads(artifacts.manifest_path.read_text(encoding="utf-8"))
+    run_provenance = manifest.get("provenance") or {}
 
     try:
-        if level1_samples:
+        if config.stage != "judge" and level1_samples:
             preflight_video = level1_samples[0].video_path
-        else:
+        elif config.stage != "judge":
             first_level2 = level2_samples[0]
             preflight_video = str(
                 await create_video_prefix(
@@ -599,15 +638,17 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                     config.prefix_cache_dir,
                 )
             )
-        await _preflight_main(
-            config, model_spec, preflight_video, artifacts.attempt_hook
-        )
+        if config.stage != "judge":
+            await _preflight_main(
+                config, model_spec, preflight_video, artifacts.attempt_hook
+            )
         summary: dict[str, Any] = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
             "run_id": run_id,
             "status": "running",
             "artifact_dir": str(artifacts.root),
+            "requested_stage": config.stage,
         }
         completion: dict[str, dict[str, Any]] = {}
 
@@ -616,23 +657,36 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 RunArtifacts.read_jsonl(artifacts.requests_path), "result"
             )
             reusable = {
-                sample_id: record
-                for sample_id, record in existing.items()
-                if record.get("phase") == "level1" and _level1_reusable(record)
+                sample.sample_id: existing[sample.sample_id]
+                for sample in level1_samples
+                if sample.sample_id in existing
+                and existing[sample.sample_id].get("phase") == "level1"
+                and _level1_reusable(existing[sample.sample_id])
+                and _level1_matches_sample(existing[sample.sample_id], sample)
             }
-            pending = [
-                sample for sample in level1_samples if sample.sample_id not in reusable
-            ]
+            pending = (
+                [
+                    sample
+                    for sample in level1_samples
+                    if sample.sample_id not in reusable
+                ]
+                if config.stage != "judge"
+                else []
+            )
             phase_started = time.perf_counter()
-            fresh = await run_level1_model_phase(
-                pending,
-                model_spec=model_spec,
-                max_tokens=config.level1_max_tokens,
-                max_concurrency=config.max_concurrency,
-                max_attempts=config.max_attempts,
-                timeout_s=config.timeout_s,
-                attempt_hook=artifacts.attempt_hook,
-                result_hook=artifacts.model_result_hook,
+            fresh = (
+                await run_level1_model_phase(
+                    pending,
+                    model_spec=model_spec,
+                    max_tokens=config.level1_max_tokens,
+                    max_concurrency=config.max_concurrency,
+                    max_attempts=config.max_attempts,
+                    timeout_s=config.timeout_s,
+                    attempt_hook=artifacts.attempt_hook,
+                    result_hook=artifacts.model_result_hook,
+                )
+                if config.stage != "judge"
+                else []
             )
             phase_wall = time.perf_counter() - phase_started
             reusable.update({str(record["sample_id"]): record for record in fresh})
@@ -655,27 +709,38 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 RunArtifacts.read_jsonl(artifacts.requests_path), "result"
             )
             reusable_model = {
-                sample_id: record
-                for sample_id, record in existing.items()
-                if record.get("phase") == "level2_model" and _level2_reusable(record)
-            }
-            pending = [
-                sample
+                sample.sample_id: existing[sample.sample_id]
                 for sample in level2_samples
-                if sample.sample_id not in reusable_model
-            ]
+                if sample.sample_id in existing
+                and existing[sample.sample_id].get("phase") == "level2_model"
+                and _level2_reusable(existing[sample.sample_id])
+                and _level2_matches_sample(existing[sample.sample_id], sample)
+            }
+            pending = (
+                [
+                    sample
+                    for sample in level2_samples
+                    if sample.sample_id not in reusable_model
+                ]
+                if config.stage != "judge"
+                else []
+            )
             model_phase_started = time.perf_counter()
-            fresh_model = await run_level2_model_phase(
-                pending,
-                model_spec=model_spec,
-                prefix_cache_dir=config.prefix_cache_dir,
-                when_max_tokens=config.when_max_tokens,
-                response_max_tokens=config.response_max_tokens,
-                max_concurrency=config.max_concurrency,
-                max_attempts=config.max_attempts,
-                timeout_s=config.timeout_s,
-                attempt_hook=artifacts.attempt_hook,
-                result_hook=artifacts.model_result_hook,
+            fresh_model = (
+                await run_level2_model_phase(
+                    pending,
+                    model_spec=model_spec,
+                    prefix_cache_dir=config.prefix_cache_dir,
+                    when_max_tokens=config.when_max_tokens,
+                    response_max_tokens=config.response_max_tokens,
+                    max_concurrency=config.max_concurrency,
+                    max_attempts=config.max_attempts,
+                    timeout_s=config.timeout_s,
+                    attempt_hook=artifacts.attempt_hook,
+                    result_hook=artifacts.model_result_hook,
+                )
+                if config.stage != "judge"
+                else []
             )
             model_phase_wall = time.perf_counter() - model_phase_started
             reusable_model.update(
@@ -688,98 +753,134 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
                 _level2_reusable,
             )
 
-            judge_journal = RunArtifacts.read_jsonl(artifacts.judges_path)
-            expected_names = {judge.name for judge in judges}
-            existing_judges = _latest_by_sample(judge_journal, "judge_result")
-            reusable_pairs = _reusable_judge_pairs(judge_journal, expected_names)
-            reusable_judges = {
-                sample_id: record
-                for sample_id, record in existing_judges.items()
-                if _judge_reusable(record, expected_names)
-            }
-            judge_pending = [
-                record
-                for record in model_records
-                if record.get("gold_when") == "YES"
-                and str(record.get("gold_response", "")).strip()
-                and str(record["sample_id"]) not in reusable_judges
-            ]
-            fresh_judge_request_count = _fresh_judge_request_count(
-                judge_pending, judges, reusable_pairs
-            )
-            if judge_pending:
-                pending_ids = {str(record["sample_id"]) for record in judge_pending}
-                judges_to_run = [
-                    judge
-                    for judge in judges
-                    if any(
-                        (sample_id, judge.name) not in reusable_pairs
-                        for sample_id in pending_ids
-                    )
+            if config.stage == "model":
+                summary["level2"] = {
+                    "selected_view": config.dataset_view,
+                    "speed": {
+                        "when": speed_summary(model_records, "when_latency_s"),
+                        "gold_response": speed_summary(
+                            model_records, "gold_response_latency_s"
+                        ),
+                        "fresh_model_phase": _wall_speed(
+                            len(fresh_model), model_phase_wall
+                        ),
+                    },
+                }
+                judge_journal = []
+            else:
+                judge_journal = RunArtifacts.read_jsonl(artifacts.judges_path)
+
+            if config.stage != "model":
+                expected_names = {judge.name for judge in judges}
+                existing_judges = _latest_by_sample(judge_journal, "judge_result")
+                reusable_pairs = _reusable_judge_pairs(judge_journal, expected_names)
+                reusable_judges = {
+                    sample_id: record
+                    for sample_id, record in existing_judges.items()
+                    if _judge_reusable(record, expected_names)
+                }
+                judge_pending = [
+                    record
+                    for record in model_records
+                    if record.get("gold_when") == "YES"
+                    and str(record.get("gold_response", "")).strip()
+                    and str(record["sample_id"]) not in reusable_judges
                 ]
-                await _preflight_judges(config, judges_to_run, artifacts.attempt_hook)
-            judge_phase_started = time.perf_counter()
-            fresh_judges = await run_level2_judge_phase(
-                {sample.sample_id: sample for sample in level2_samples},
-                judge_pending,
-                judges=judges,
-                max_concurrency=config.judge_max_concurrency,
-                max_attempts=config.max_attempts,
-                timeout_s=config.timeout_s,
-                existing_judge_records=judge_journal,
-                attempt_hook=artifacts.attempt_hook,
-                result_hook=artifacts.judge_result_hook,
-            )
-            judge_phase_wall = time.perf_counter() - judge_phase_started
-            reusable_judges.update(
-                {str(record["sample_id"]): record for record in fresh_judges}
-            )
-            required_judge_ids = [
-                str(record["sample_id"])
-                for record in model_records
-                if record.get("gold_when") == "YES"
-                and str(record.get("gold_response", "")).strip()
-            ]
-            completion["level2_judge"] = _completion_report(
-                required_judge_ids,
-                reusable_judges,
-                lambda record: _judge_reusable(record, expected_names),
-            )
-            merged = merge_judge_records(model_records, list(reusable_judges.values()))
-            judge_names = [judge.name for judge in judges]
-            all_metrics = compute_socialomni_level2_metrics(
-                merged,
-                judge_names=judge_names,
-                judge_model_families=_judge_families(judges),
-                bootstrap_seed=config.bootstrap_seed,
-                bootstrap_samples=config.bootstrap_samples,
-            )
-            level2_summary: dict[str, Any] = {
-                "selected_view": config.dataset_view,
-                "selected": all_metrics,
-                "speed": {
-                    "when": speed_summary(merged, "when_latency_s"),
-                    "gold_response": speed_summary(merged, "gold_response_latency_s"),
-                    "fresh_model_phase": _wall_speed(
-                        len(fresh_model), model_phase_wall
-                    ),
-                    "fresh_judge_phase": _wall_speed(
-                        fresh_judge_request_count, judge_phase_wall
-                    ),
-                },
-            }
-            if (
-                config.dataset_view == "all"
-                and len(merged) >= SOCIALOMNI_PAPER_CORE_SIZE
-            ):
-                level2_summary["paper_core_200"] = compute_socialomni_level2_metrics(
-                    merged[:SOCIALOMNI_PAPER_CORE_SIZE],
-                    judge_names=judge_names,
-                    judge_model_families=_judge_families(judges),
-                    bootstrap_seed=config.bootstrap_seed,
-                    bootstrap_samples=config.bootstrap_samples,
+                fresh_judge_request_count = _fresh_judge_request_count(
+                    judge_pending, active_judges, reusable_pairs
                 )
-            summary["level2"] = level2_summary
+                if judge_pending:
+                    pending_ids = {str(record["sample_id"]) for record in judge_pending}
+                    judges_to_run = [
+                        judge
+                        for judge in active_judges
+                        if any(
+                            (sample_id, judge.name) not in reusable_pairs
+                            for sample_id in pending_ids
+                        )
+                    ]
+                    await _preflight_judges(
+                        config, judges_to_run, artifacts.attempt_hook
+                    )
+                judge_phase_started = time.perf_counter()
+                fresh_judges = await run_level2_judge_phase(
+                    {sample.sample_id: sample for sample in level2_samples},
+                    judge_pending,
+                    judges=active_judges,
+                    max_concurrency=config.judge_max_concurrency,
+                    max_attempts=config.max_attempts,
+                    timeout_s=config.timeout_s,
+                    existing_judge_records=judge_journal,
+                    attempt_hook=artifacts.attempt_hook,
+                    result_hook=artifacts.judge_result_hook,
+                )
+                judge_phase_wall = time.perf_counter() - judge_phase_started
+                reusable_judges.update(
+                    {
+                        str(record["sample_id"]): record
+                        for record in fresh_judges
+                        if _judge_reusable(record, expected_names)
+                    }
+                )
+                required_judge_ids = [
+                    str(record["sample_id"])
+                    for record in model_records
+                    if record.get("gold_when") == "YES"
+                    and str(record.get("gold_response", "")).strip()
+                ]
+                completion["level2_judge"] = _completion_report(
+                    required_judge_ids,
+                    reusable_judges,
+                    lambda record: _judge_reusable(record, expected_names),
+                )
+                level2_summary: dict[str, Any] = {
+                    "selected_view": config.dataset_view,
+                    "requested_judges": [judge.name for judge in active_judges],
+                    "available_judge_pairs": len(
+                        _reusable_judge_pairs(
+                            RunArtifacts.read_jsonl(artifacts.judges_path),
+                            expected_names,
+                        )
+                    ),
+                    "speed": {
+                        "when": speed_summary(model_records, "when_latency_s"),
+                        "gold_response": speed_summary(
+                            model_records, "gold_response_latency_s"
+                        ),
+                        "fresh_model_phase": _wall_speed(
+                            len(fresh_model), model_phase_wall
+                        ),
+                        "fresh_judge_phase": _wall_speed(
+                            fresh_judge_request_count, judge_phase_wall
+                        ),
+                    },
+                }
+                if completion["level2_judge"]["complete"]:
+                    merged = merge_judge_records(
+                        model_records, list(reusable_judges.values())
+                    )
+                    judge_names = [judge.name for judge in judges]
+                    level2_summary["selected"] = compute_socialomni_level2_metrics(
+                        merged,
+                        judge_names=judge_names,
+                        judge_model_families=_judge_families(judges),
+                        bootstrap_seed=config.bootstrap_seed,
+                        bootstrap_samples=config.bootstrap_samples,
+                    )
+                    if (
+                        config.dataset_view == "all"
+                        and len(merged) >= SOCIALOMNI_PAPER_CORE_SIZE
+                    ):
+                        level2_summary["paper_core_200"] = (
+                            compute_socialomni_level2_metrics(
+                                merged[:SOCIALOMNI_PAPER_CORE_SIZE],
+                                judge_names=judge_names,
+                                judge_model_families=_judge_families(judges),
+                                bootstrap_seed=config.bootstrap_seed,
+                                bootstrap_samples=config.bootstrap_samples,
+                            )
+                        )
+                summary["level2"] = level2_summary
 
         formal_level1 = config.level not in {"level1", "both"} or (
             config.max_samples is None and len(level1_samples) == 2000
@@ -793,14 +894,21 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             and {judge.name for judge in judges} == set(SOCIALOMNI_JUDGE_NAMES)
         )
         clean_commit = bool(
-            provenance["repository"]["commit"]
-            and provenance["repository"]["dirty"] is False
+            (run_provenance.get("repository") or {}).get("commit")
+            and (run_provenance.get("repository") or {}).get("dirty") is False
         )
         pinned_dataset = (
             dataset_info.is_paper_snapshot and selected_media_manifest_verified
         )
-        reproducible_provenance = _formal_provenance_complete(provenance)
+        reproducible_provenance = _formal_provenance_complete(run_provenance)
         all_records_complete = all(phase["complete"] for phase in completion.values())
+        required_formal_phases = {
+            *(("level1_model",) if level1_samples else ()),
+            *(("level2_model", "level2_judge") if level2_samples else ()),
+        }
+        formal_records_complete = required_formal_phases.issubset(completion) and all(
+            completion[phase]["complete"] for phase in required_formal_phases
+        )
         run_status = "complete" if all_records_complete else "incomplete"
         summary["status"] = run_status
         summary["completion"] = completion
@@ -813,7 +921,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             and formal_level2
             and pinned_dataset
             and reproducible_provenance
-            and all_records_complete
+            and formal_records_complete
         )
         summary["failures"] = RunArtifacts.read_jsonl(artifacts.failures_path)
         artifacts.finish(summary, status=run_status)
@@ -859,6 +967,14 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--frame-height", type=int, default=128)
     parser.add_argument("--frame-jpeg-quality", type=int, default=50)
     parser.add_argument("--level", choices=("level1", "level2", "both"), default="both")
+    parser.add_argument("--stage", choices=("all", "model", "judge"), default="all")
+    parser.add_argument(
+        "--judge",
+        action="append",
+        dest="judge_names",
+        default=(),
+        help="run only this configured judge; repeat to select multiple judges",
+    )
     parser.add_argument(
         "--dataset-view", choices=("all", "paper-core-200"), default="all"
     )
