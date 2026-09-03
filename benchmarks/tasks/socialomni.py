@@ -440,8 +440,10 @@ def parse_choice(text: str, choices: Sequence[str]) -> str:
         return ""
     alphabet = "".join(re.escape(choice) for choice in choices)
     tagged = re.findall(rf"(?:ANSWER|CHOICE)\s*(?:IS|:)?\s*([{alphabet}])\b", content)
-    if tagged:
-        return tagged[0] if len(set(tagged)) == 1 else ""
+    boxed = re.findall(rf"\\?BOXED\s*\{{\s*([{alphabet}])\s*\}}", content)
+    explicit = tagged + boxed
+    if explicit:
+        return explicit[0] if len(set(explicit)) == 1 else ""
     plain = re.fullmatch(rf"([{alphabet}])[.)]?", content)
     if plain:
         return plain.group(1)
