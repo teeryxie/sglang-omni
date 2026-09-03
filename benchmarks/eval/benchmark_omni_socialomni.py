@@ -33,6 +33,10 @@ from benchmarks.metrics.socialomni import (
 )
 from benchmarks.runtime_metrics import collect_benchmark_provenance
 from benchmarks.tasks.socialomni import (
+    JUDGE_MAX_TOKENS,
+    LEVEL1_MAX_TOKENS,
+    LEVEL2_RESPONSE_MAX_TOKENS,
+    LEVEL2_WHEN_MAX_TOKENS,
     load_judge_config,
     make_level1_send_fn,
     parse_choice,
@@ -46,6 +50,8 @@ from benchmarks.tasks.socialomni import (
 class SocialOmniEvalConfig:
     dataset_root: str
     model: str
+    model_revision: str | None
+    launch_command: str | None
     base_url: str
     level: Literal["level1", "level2", "both"]
     judge_config: str | None
@@ -103,10 +109,10 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     dataset_identity = inspect_socialomni_dataset(config.dataset_root, levels)
     provenance = collect_benchmark_provenance(
         model_id=config.model,
-        model_revision=None,
+        model_revision=config.model_revision,
         dataset_id=SOCIALOMNI_DATASET_ID,
-        dataset_revision=SOCIALOMNI_DATASET_REVISION,
-        launch_command=None,
+        dataset_revision=None,
+        launch_command=config.launch_command,
         server_config={
             "base_url": config.base_url,
             "max_concurrency": config.max_concurrency,
@@ -123,6 +129,14 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             "judge_config": None,
             "dataset_id": SOCIALOMNI_DATASET_ID,
             "expected_dataset_revision": SOCIALOMNI_DATASET_REVISION,
+            "generation": {
+                "temperature": 0.0,
+                "stream": False,
+                "level1_max_tokens": LEVEL1_MAX_TOKENS,
+                "level2_when_max_tokens": LEVEL2_WHEN_MAX_TOKENS,
+                "level2_response_max_tokens": LEVEL2_RESPONSE_MAX_TOKENS,
+                "judge_max_tokens": JUDGE_MAX_TOKENS,
+            },
         },
         "dataset": dataset_identity,
         "provenance": provenance,
@@ -289,6 +303,8 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     output["summary"]["formal_evaluation_complete"] = bool(
         output["provenance"]["repository"]["commit"]
         and output["provenance"]["repository"]["dirty"] is False
+        and bool(config.model_revision)
+        and bool(config.launch_command)
         and output["dataset"]["metadata_matches_expected_revision"]
         and (
             "level1" not in levels or output["summary"]["level1"]["formal_sample_count"]
@@ -311,6 +327,8 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--model", required=True)
+    parser.add_argument("--model-revision")
+    parser.add_argument("--launch-command")
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--level", choices=("level1", "level2", "both"), default="both")
     parser.add_argument("--judge-config")

@@ -13,6 +13,9 @@ from benchmarks.eval import benchmark_omni_socialomni as entrypoint
 from benchmarks.tasks.socialomni import (
     JUDGE_MAX_TOKENS,
     JUDGE_PARSE_ATTEMPTS,
+    LEVEL1_MAX_TOKENS,
+    LEVEL2_RESPONSE_MAX_TOKENS,
+    LEVEL2_WHEN_MAX_TOKENS,
     JudgeSpec,
     bounded_map,
     build_ffmpeg_prefix_command,
@@ -56,6 +59,8 @@ def _config(**overrides) -> entrypoint.SocialOmniEvalConfig:
     values = {
         "dataset_root": ".",
         "model": "qwen3-omni",
+        "model_revision": "model-revision",
+        "launch_command": "python -m sglang_omni.cli serve ...",
         "base_url": "http://localhost:8000",
         "level": "level1",
         "judge_config": None,
@@ -451,6 +456,8 @@ async def test_level2_automatically_derives_first_200_view(monkeypatch) -> None:
     config = entrypoint.SocialOmniEvalConfig(
         dataset_root=".",
         model="qwen3-omni",
+        model_revision="model-revision",
+        launch_command="python -m sglang_omni.cli serve ...",
         base_url="http://localhost:8000",
         level="level2",
         judge_config=None,
@@ -489,12 +496,22 @@ async def test_invalid_judge_config_fails_before_level2_requests(
 
 
 @pytest.mark.parametrize(
-    ("sample_count", "mini", "dirty", "metadata_matches", "expected"),
+    (
+        "sample_count",
+        "mini",
+        "dirty",
+        "metadata_matches",
+        "model_revision",
+        "launch_command",
+        "expected",
+    ),
     [
-        (2_000, False, False, True, "complete"),
-        (2_000, False, True, True, "incomplete"),
-        (2_000, False, False, False, "incomplete"),
-        (2, True, False, True, "incomplete"),
+        (2_000, False, False, True, "model-revision", "serve command", "complete"),
+        (2_000, False, True, True, "model-revision", "serve command", "incomplete"),
+        (2_000, False, False, False, "model-revision", "serve command", "incomplete"),
+        (2, True, False, True, "model-revision", "serve command", "incomplete"),
+        (2_000, False, False, True, None, "serve command", "incomplete"),
+        (2_000, False, False, True, "model-revision", None, "incomplete"),
     ],
 )
 @pytest.mark.asyncio
@@ -504,6 +521,8 @@ async def test_formal_status_requires_clean_repository_and_expected_metadata(
     mini: bool,
     dirty: bool,
     metadata_matches: bool,
+    model_revision: str | None,
+    launch_command: str | None,
     expected: str,
 ) -> None:
     samples = [
@@ -550,13 +569,29 @@ async def test_formal_status_requires_clean_repository_and_expected_metadata(
     )
 
     def fake_provenance(**kwargs):
-        assert kwargs["dataset_revision"] == entrypoint.SOCIALOMNI_DATASET_REVISION
+        assert kwargs["dataset_revision"] is None
+        assert kwargs["model_revision"] == model_revision
+        assert kwargs["launch_command"] == launch_command
         return {"repository": {"commit": "abc", "dirty": dirty}}
 
     monkeypatch.setattr(entrypoint, "collect_benchmark_provenance", fake_provenance)
-    result = await entrypoint.run_socialomni(_config(mini=mini))
+    result = await entrypoint.run_socialomni(
+        _config(
+            mini=mini,
+            model_revision=model_revision,
+            launch_command=launch_command,
+        )
+    )
     assert result["summary"]["status"] == "complete"
     assert result["summary"]["formal_status"] == expected
+    assert result["config"]["generation"] == {
+        "temperature": 0.0,
+        "stream": False,
+        "level1_max_tokens": LEVEL1_MAX_TOKENS,
+        "level2_when_max_tokens": LEVEL2_WHEN_MAX_TOKENS,
+        "level2_response_max_tokens": LEVEL2_RESPONSE_MAX_TOKENS,
+        "judge_max_tokens": JUDGE_MAX_TOKENS,
+    }
 
 
 @pytest.mark.asyncio

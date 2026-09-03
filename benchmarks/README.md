@@ -227,16 +227,22 @@ from `configs/socialomni_judges.example.json`.
 # Deterministic smoke set: both Level 1 visibility strata and Level 2 YES/NO.
 python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \
+    --model-revision <model-revision> \
+    --launch-command '<server launch command>' \
     --level both --mini --judge-config /path/to/judges.json
 
 # All 2,000 Level 1 items.
 python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \
+    --model-revision <model-revision> \
+    --launch-command '<server launch command>' \
     --level level1
 
 # All 209 maintained Level 2 items; also emits the first-200 paper view.
 python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \
+    --model-revision <model-revision> \
+    --launch-command '<server launch command>' \
     --level level2 --judge-config /path/to/judges.json \
     --prefix-cache-dir /path/to/socialomni-prefixes
 ```
@@ -259,8 +265,10 @@ the benchmark never substitutes a two-judge mean. Latency percentiles and
 throughput are engineering diagnostics, not SocialOmni paper metrics.
 The result `status` covers the requested run (including mini runs), while
 `formal_status` is complete only for a clean, full-size run whose metadata
-matches the pinned public dataset revision. Local dataset verification covers
-the released metadata files; the result labels this scope as `metadata_only`.
+matches the pinned public dataset revision and declares the model revision and
+server launch command. Local dataset verification covers the released metadata
+files; the result labels this scope as `metadata_only` and does not claim that
+local media bytes were fetched from the pinned public revision.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

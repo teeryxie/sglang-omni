@@ -37,6 +37,9 @@ PREFIX_ENCODING = {
 }
 JUDGE_MAX_TOKENS = 4096
 JUDGE_PARSE_ATTEMPTS = 3
+LEVEL1_MAX_TOKENS = 32
+LEVEL2_WHEN_MAX_TOKENS = 8
+LEVEL2_RESPONSE_MAX_TOKENS = 256
 
 
 @dataclass(frozen=True)
@@ -433,7 +436,10 @@ def make_level1_send_fn(model: str, base_url: str):
             session,
             api_url=chat_completions_url(base_url),
             payload=model_payload(
-                model, build_level1_prompt(sample), sample.video_path, 32
+                model,
+                build_level1_prompt(sample),
+                sample.video_path,
+                LEVEL1_MAX_TOKENS,
             ),
             request_id=sample.sample_id,
         )
@@ -482,7 +488,12 @@ async def run_level2_model(
             when = await request_chat_completion(
                 session,
                 api_url=chat_completions_url(base_url),
-                payload=model_payload(model, build_when_prompt(sample), str(prefix), 8),
+                payload=model_payload(
+                    model,
+                    build_when_prompt(sample),
+                    str(prefix),
+                    LEVEL2_WHEN_MAX_TOKENS,
+                ),
                 request_id=f"{sample.sample_id}:when",
             )
             requests.append(when)
@@ -492,7 +503,10 @@ async def run_level2_model(
                     session,
                     api_url=chat_completions_url(base_url),
                     payload=model_payload(
-                        model, build_response_prompt(sample), str(prefix), 256
+                        model,
+                        build_response_prompt(sample),
+                        str(prefix),
+                        LEVEL2_RESPONSE_MAX_TOKENS,
                     ),
                     request_id=f"{sample.sample_id}:response",
                 )
