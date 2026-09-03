@@ -39,10 +39,13 @@ from benchmarks.metrics.socialomni import (
 from benchmarks.runtime_metrics import collect_benchmark_provenance
 from benchmarks.tasks.socialomni import (
     JudgeSpec,
+    ModelSpec,
     _client_session,
+    create_video_prefix,
     load_judge_config,
     merge_judge_records,
     preflight_endpoint,
+    request_model_completion,
     run_level1_model_phase,
     run_level2_judge_phase,
     run_level2_model_phase,
@@ -59,6 +62,14 @@ class SocialOmniEvalConfig:
     dataset_root: str
     model: str
     base_url: str = "http://localhost:8000"
+    model_api_key_env: str | None = None
+    model_video_input: str = "server-path"
+    use_audio_in_video: bool = True
+    frame_interval_s: float = 1.0
+    frame_max_count: int | None = None
+    frame_width: int = 128
+    frame_height: int = 128
+    frame_jpeg_quality: int = 50
     level: str = "both"
     dataset_view: str = "all"
     judge_config: str | None = None
@@ -376,6 +387,7 @@ def _contract(
         "model": config.model,
         "model_revision": config.model_revision,
         "base_url": config.base_url.rstrip("/"),
+        "model_endpoint": _model_spec(config).public_dict(),
         "dataset": asdict(dataset_info),
         "selected_media_manifest_verified": media_manifest_verified,
         "level": config.level,
@@ -416,16 +428,49 @@ def _contract(
 
 
 async def _preflight_main(
-    config: SocialOmniEvalConfig, attempt_hook: Callable[[dict[str, Any]], None]
+    config: SocialOmniEvalConfig,
+    model_spec: ModelSpec,
+    video_path: str,
+    attempt_hook: Callable[[dict[str, Any]], None],
 ) -> None:
     timeout = aiohttp.ClientTimeout(total=config.timeout_s)
     async with _client_session(timeout) as session:
-        await preflight_endpoint(
+        result = await request_model_completion(
             session,
-            base_url=config.base_url,
-            model=config.model,
+            spec=model_spec,
+            prompt="Reply with OK.",
+            video_path=video_path,
+            max_tokens=max(
+                config.level1_max_tokens,
+                config.when_max_tokens,
+                config.response_max_tokens,
+            ),
+            request_id=f"preflight:{config.model}",
+            phase="preflight",
+            max_attempts=1,
             attempt_hook=attempt_hook,
         )
+    if not result.is_success:
+        raise RuntimeError(
+            f"endpoint media preflight failed for {config.model}: {result.error}"
+        )
+
+
+def _model_spec(config: SocialOmniEvalConfig) -> ModelSpec:
+    spec = ModelSpec(
+        model=config.model,
+        base_url=config.base_url,
+        api_key_env=config.model_api_key_env,
+        video_input=config.model_video_input,
+        use_audio_in_video=config.use_audio_in_video,
+        frame_interval_s=config.frame_interval_s,
+        frame_max_count=config.frame_max_count,
+        frame_width=config.frame_width,
+        frame_height=config.frame_height,
+        frame_jpeg_quality=config.frame_jpeg_quality,
+    )
+    spec.validate()
+    return spec
 
 
 async def _preflight_judges(
@@ -456,6 +501,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         raise ValueError("concurrency values must be >= 1")
     if config.max_attempts < 1 or config.bootstrap_samples < 1:
         raise ValueError("max_attempts and bootstrap_samples must be >= 1")
+    model_spec = _model_spec(config)
 
     dataset_info = inspect_socialomni_dataset(config.dataset_root)
     level1_samples = (
@@ -515,7 +561,13 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         launch_command=config.launch_command,
         server_config={
             "base_url": config.base_url,
-            "use_audio_in_video": True,
+            "model_video_input": config.model_video_input,
+            "use_audio_in_video": config.use_audio_in_video,
+            "frame_interval_s": config.frame_interval_s,
+            "frame_max_count": config.frame_max_count,
+            "frame_width": config.frame_width,
+            "frame_height": config.frame_height,
+            "frame_jpeg_quality": config.frame_jpeg_quality,
             "temperature": 0.0,
         },
     )
@@ -536,7 +588,20 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
     artifacts.prepare(contract, provenance, resume=config.resume)
 
     try:
-        await _preflight_main(config, artifacts.attempt_hook)
+        if level1_samples:
+            preflight_video = level1_samples[0].video_path
+        else:
+            first_level2 = level2_samples[0]
+            preflight_video = str(
+                await create_video_prefix(
+                    first_level2.video_path,
+                    first_level2.timestamp_s,
+                    config.prefix_cache_dir,
+                )
+            )
+        await _preflight_main(
+            config, model_spec, preflight_video, artifacts.attempt_hook
+        )
         summary: dict[str, Any] = {
             "schema_version": RESULT_SCHEMA_VERSION,
             "protocol_version": PROTOCOL_VERSION,
@@ -561,8 +626,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             phase_started = time.perf_counter()
             fresh = await run_level1_model_phase(
                 pending,
-                base_url=config.base_url,
-                model=config.model,
+                model_spec=model_spec,
                 max_tokens=config.level1_max_tokens,
                 max_concurrency=config.max_concurrency,
                 max_attempts=config.max_attempts,
@@ -603,8 +667,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
             model_phase_started = time.perf_counter()
             fresh_model = await run_level2_model_phase(
                 pending,
-                base_url=config.base_url,
-                model=config.model,
+                model_spec=model_spec,
                 prefix_cache_dir=config.prefix_cache_dir,
                 when_max_tokens=config.when_max_tokens,
                 response_max_tokens=config.response_max_tokens,
@@ -781,6 +844,20 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-root", required=True)
     parser.add_argument("--model", required=True)
     parser.add_argument("--base-url", default="http://localhost:8000")
+    parser.add_argument("--model-api-key-env")
+    parser.add_argument(
+        "--model-video-input",
+        choices=("server-path", "inline-frames", "upload-av"),
+        default="server-path",
+    )
+    parser.add_argument(
+        "--use-audio-in-video", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--frame-interval-s", type=float, default=1.0)
+    parser.add_argument("--frame-max-count", type=int)
+    parser.add_argument("--frame-width", type=int, default=128)
+    parser.add_argument("--frame-height", type=int, default=128)
+    parser.add_argument("--frame-jpeg-quality", type=int, default=50)
     parser.add_argument("--level", choices=("level1", "level2", "both"), default="both")
     parser.add_argument(
         "--dataset-view", choices=("all", "paper-core-200"), default="all"

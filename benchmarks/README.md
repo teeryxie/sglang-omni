@@ -248,6 +248,17 @@ python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \
     --level level1 --run-id level1-full
 
+# Paper-compatible Gemini visual-only input: one 128x128 JPEG frame per second.
+# The API key value is read from the named environment variable and is never
+# written to the manifest.
+python -m benchmarks.eval.benchmark_omni_socialomni \
+    --dataset-root /path/to/socialomni --model gemini-2.5-pro \
+    --base-url https://openai-compatible.example/v1 \
+    --model-api-key-env SOCIALOMNI_COMPANY_API_KEY \
+    --model-video-input inline-frames --no-use-audio-in-video \
+    --frame-interval-s 1 --frame-width 128 --frame-height 128 \
+    --frame-jpeg-quality 50 --level level1 --run-id gemini-level1-full
+
 # All 209 maintained Level 2 items; also emits the first-200 paper view.
 python -m benchmarks.eval.benchmark_omni_socialomni \
     --dataset-root /path/to/socialomni --model qwen3-omni \
@@ -290,6 +301,15 @@ sample record makes the model phase incomplete. Judge scoring is stricter: an
 invalid or missing score is persisted and makes the run incomplete. The formal
 environment gate requires exactly eight H20 entries and `sglang==0.5.18` in the
 recorded provenance.
+
+The tested-model transport is explicit. `server-path` uses the SGLang Omni
+extension that lets a local endpoint read the same media file and can include
+its audio track. `inline-frames` extracts visual-only frames and sends standard
+OpenAI-compatible `image_url` data URIs; its interval, dimensions, frame cap,
+and JPEG quality are part of the resume fingerprint. `upload-av` posts the
+fixed-prefix media to the SocialOmni reference server's multipart `/analyze`
+contract. A media-bearing preflight is performed before scored requests, so a
+text-only endpoint cannot pass compatibility checks accidentally.
 
 The two `*_seedtts.py` scripts merge the previous `benchmark_*_tts_speed.py`
 and `voice_clone_*_wer.py` pairs into a single two-phase pipeline: phase 1

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import shutil
 import subprocess
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -19,6 +21,7 @@ from benchmarks.eval.benchmark_omni_socialomni import RunArtifacts, SocialOmniEv
 from benchmarks.tasks.socialomni import (
     ChatResult,
     JudgeSpec,
+    ModelSpec,
     _client_session,
     bounded_map,
     build_ffmpeg_prefix_command,
@@ -27,6 +30,7 @@ from benchmarks.tasks.socialomni import (
     build_response_prompt,
     build_when_prompt,
     create_video_prefix,
+    extract_inline_video_frames,
     judge_payload,
     load_judge_config,
     model_payload,
@@ -34,6 +38,7 @@ from benchmarks.tasks.socialomni import (
     parse_judge_score,
     parse_when,
     request_chat_completion,
+    request_upload_av_completion,
     resolve_ffmpeg_executable,
     run_level2_judge_phase,
 )
@@ -79,11 +84,55 @@ def test_model_prompts_do_not_leak_reference_material(tmp_path: Path) -> None:
     ]
 
     assert all("SECRET" not in prompt for prompt in prompts)
+    assert "$LETTER" not in prompts[0]
     judge_prompt = build_judge_prompt(sample2, "candidate")
     assert "SECRET ASR" in judge_prompt
     assert "SECRET REFERENCE" in judge_prompt
     payload = model_payload("model", prompts[1], sample2.video_path, max_tokens=8)
     assert payload["use_audio_in_video"] is True
+
+    visual_prompts = [
+        build_level1_prompt(sample1, visual_only=True),
+        build_when_prompt(sample2, visual_only=True),
+        build_response_prompt(sample2, visual_only=True),
+    ]
+    assert all("audio" not in prompt.lower() for prompt in visual_prompts)
+    assert all(
+        "video-frame" in prompt.lower() or "video frames" in prompt.lower()
+        for prompt in visual_prompts
+    )
+
+
+def test_inline_frame_payload_uses_openai_image_content() -> None:
+    payload = model_payload(
+        "gemini-2.5-pro",
+        "question",
+        "/private/video.mp4",
+        max_tokens=32,
+        frame_data_uris=("data:image/jpeg;base64,AAAA",),
+    )
+
+    assert "videos" not in payload
+    assert "use_audio_in_video" not in payload
+    assert payload["messages"][0]["content"] == [
+        {"type": "text", "text": "question"},
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/jpeg;base64,AAAA"},
+        },
+    ]
+
+
+def test_model_spec_validates_paper_media_transport() -> None:
+    ModelSpec(
+        model="gemini-2.5-pro",
+        base_url="https://example.test/v1",
+        video_input="inline-frames",
+    ).validate()
+    with pytest.raises(ValueError, match="video_input"):
+        ModelSpec(
+            model="model", base_url="http://example", video_input="unknown"
+        ).validate()
 
 
 @pytest.mark.parametrize(
@@ -412,6 +461,27 @@ def test_retry_records_http_failure_and_success() -> None:
     assert "HTTP 503" in attempts[0]["error"]
 
 
+def test_upload_av_transport_reads_reference_server_answer(tmp_path: Path) -> None:
+    video = tmp_path / "prefix.mp4"
+    video.write_bytes(b"media")
+    session = _Session([_Response(200, {"answer": "Answer: B"})])
+
+    result = asyncio.run(
+        request_upload_av_completion(
+            session,  # type: ignore[arg-type]
+            api_url="http://example/analyze",
+            video_path=str(video),
+            prompt="question",
+            request_id="sample",
+            phase="level1",
+            max_attempts=1,
+        )
+    )
+
+    assert result.is_success is True
+    assert result.text == "Answer: B"
+
+
 def test_attempt_offset_keeps_attempt_numbers_monotonic() -> None:
     attempts: list[dict] = []
     session = _Session([_Response(200, {"choices": [{"message": {"content": "OK"}}]})])
@@ -624,12 +694,23 @@ def test_contract_fingerprint_covers_stable_runtime_identity(tmp_path: Path) -> 
         judges=[],
         provenance={**provenance, "dependency_freeze_sha256": "freeze-two"},
     )
+    changed_media_transport = socialomni_benchmark._contract(
+        replace(config, model_video_input="inline-frames"),
+        dataset_info=dataset_info,
+        level1_ids=["one"],
+        level2_ids=[],
+        judges=[],
+        provenance=provenance,
+    )
 
     assert RunArtifacts.fingerprint(first) == RunArtifacts.fingerprint(
         dynamic_gpu_change
     )
     assert RunArtifacts.fingerprint(first) != RunArtifacts.fingerprint(
         changed_environment
+    )
+    assert RunArtifacts.fingerprint(first) != RunArtifacts.fingerprint(
+        changed_media_transport
     )
 
 
@@ -780,9 +861,7 @@ def test_failed_model_result_is_fixed_wrong_answer_and_preserves_artifacts(
         },
     )
 
-    async def successful_preflight(
-        _config: SocialOmniEvalConfig, _attempt_hook
-    ) -> None:
+    async def successful_preflight(*_args) -> None:
         return None
 
     async def failed_phase(_samples, **kwargs):
@@ -866,9 +945,7 @@ def test_missing_model_result_marks_artifacts_incomplete(
         },
     )
 
-    async def successful_preflight(
-        _config: SocialOmniEvalConfig, _attempt_hook
-    ) -> None:
+    async def successful_preflight(*_args) -> None:
         return None
 
     async def empty_phase(_samples, **_kwargs):
@@ -933,6 +1010,45 @@ def test_ffmpeg_command_reencodes_instead_of_stream_copy(tmp_path: Path) -> None
     assert command[command.index("-c:v") + 1] == "libx264"
     assert command[command.index("-c:a") + 1] == "aac"
     assert command[command.index("-t") + 1] == "1.250000"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg is required")
+def test_inline_frame_extraction_matches_fixed_sampling(tmp_path: Path) -> None:
+    source = tmp_path / "source.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=red:s=32x24:r=10:d=2.2",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            str(source),
+        ],
+        check=True,
+    )
+
+    frames = asyncio.run(
+        extract_inline_video_frames(
+            source,
+            interval_s=1.0,
+            max_count=None,
+            width=128,
+            height=128,
+            jpeg_quality=50,
+        )
+    )
+
+    assert len(frames) == 3
+    assert all(frame.startswith("data:image/jpeg;base64,") for frame in frames)
+    encoded = frames[0].split(",", 1)[1]
+    assert base64.b64decode(encoded).startswith(b"\xff\xd8")
 
 
 def test_ffmpeg_resolver_falls_back_to_project_binary(

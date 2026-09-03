@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
+import io
 import json
 import math
 import os
@@ -19,6 +21,7 @@ from typing import Any, TypeVar
 
 import aiohttp
 import imageio_ffmpeg
+from PIL import Image
 
 from benchmarks.dataset.socialomni import SocialOmniLevel1Sample, SocialOmniLevel2Sample
 
@@ -38,6 +41,46 @@ PREFIX_ENCODING_CONFIG = {
 }
 T = TypeVar("T")
 R = TypeVar("R")
+MODEL_VIDEO_INPUTS = frozenset({"server-path", "inline-frames", "upload-av"})
+
+
+@dataclass(frozen=True)
+class ModelSpec:
+    """One tested-model endpoint and its paper-visible media transport."""
+
+    model: str
+    base_url: str
+    api_key_env: str | None = None
+    video_input: str = "server-path"
+    use_audio_in_video: bool = True
+    frame_interval_s: float = 1.0
+    frame_max_count: int | None = None
+    frame_width: int = 128
+    frame_height: int = 128
+    frame_jpeg_quality: int = 50
+
+    @property
+    def api_url(self) -> str:
+        if self.video_input == "upload-av":
+            return f"{self.base_url.rstrip('/')}/analyze"
+        return chat_completions_url(self.base_url)
+
+    def validate(self) -> None:
+        if self.video_input not in MODEL_VIDEO_INPUTS:
+            raise ValueError(
+                f"model video_input must be one of {sorted(MODEL_VIDEO_INPUTS)}"
+            )
+        if self.frame_interval_s <= 0:
+            raise ValueError("frame_interval_s must be > 0")
+        if self.frame_max_count is not None and self.frame_max_count < 1:
+            raise ValueError("frame_max_count must be >= 1")
+        if self.frame_width < 1 or self.frame_height < 1:
+            raise ValueError("frame dimensions must be >= 1")
+        if not 1 <= self.frame_jpeg_quality <= 95:
+            raise ValueError("frame_jpeg_quality must be between 1 and 95")
+
+    def public_dict(self) -> dict[str, Any]:
+        return asdict(self)
 
 
 @dataclass(frozen=True)
@@ -263,6 +306,90 @@ async def request_chat_completion(
     return last
 
 
+async def request_upload_av_completion(
+    session: aiohttp.ClientSession,
+    *,
+    api_url: str,
+    video_path: str,
+    prompt: str,
+    request_id: str,
+    phase: str,
+    max_attempts: int = 3,
+    retry_backoff_s: float = 1.0,
+    attempt_hook: AttemptHook | None = None,
+) -> ChatResult:
+    """Call the common SocialOmni native AV multipart `/analyze` endpoint."""
+
+    source = Path(video_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"video not found: {source}")
+    last = ChatResult(request_id, "", False, 0.0, error="not attempted")
+    for attempt in range(1, max_attempts + 1):
+        started = time.perf_counter()
+        status: int | None = None
+        text = ""
+        error = ""
+        retryable = False
+        try:
+            form = aiohttp.FormData()
+            form.add_field("question", prompt)
+            form.add_field("use_video", "true")
+            form.add_field("use_audio", "true")
+            form.add_field("visual_mask", "false")
+            with source.open("rb") as handle:
+                form.add_field(
+                    "video",
+                    handle,
+                    filename=source.name,
+                    content_type="video/mp4",
+                )
+                async with session.post(api_url, data=form) as response:
+                    status = response.status
+                    response_text = await response.text()
+                    if status >= 400:
+                        error = f"HTTP {status}: {response_text[:2000]}"
+                        retryable = status in RETRYABLE_HTTP_STATUS or status >= 500
+                    else:
+                        body = json.loads(response_text)
+                        text = str(body.get("answer") or "")
+                        if not text.strip():
+                            error = "empty response"
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            error = str(exc)
+            retryable = True
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            error = f"invalid response: {exc}"
+        latency = time.perf_counter() - started
+        success = not error
+        last = ChatResult(
+            request_id=request_id,
+            text=text,
+            is_success=success,
+            latency_s=latency,
+            status_code=status,
+            error=error,
+            retryable=retryable,
+        )
+        if attempt_hook:
+            attempt_hook(
+                {
+                    "record_type": "attempt",
+                    "phase": phase,
+                    "request_id": request_id,
+                    "attempt": attempt,
+                    "success": success,
+                    "status_code": status,
+                    "latency_s": round(latency, 6),
+                    "raw_response": text,
+                    "error": error,
+                }
+            )
+        if success or not retryable or attempt == max_attempts:
+            return last
+        await asyncio.sleep(retry_backoff_s * (2 ** (attempt - 1)))
+    return last
+
+
 async def preflight_endpoint(
     session: aiohttp.ClientSession,
     *,
@@ -342,7 +469,9 @@ def parse_judge_score(text: str) -> int | None:
     return score if score in JUDGE_SCORE_BUCKETS else None
 
 
-def build_level1_prompt(sample: SocialOmniLevel1Sample) -> str:
+def build_level1_prompt(
+    sample: SocialOmniLevel1Sample, *, visual_only: bool = False
+) -> str:
     stripped_options = [
         re.sub(r"^[A-D][.)]\s*", "", option.strip()) for option in sample.options
     ]
@@ -350,30 +479,37 @@ def build_level1_prompt(sample: SocialOmniLevel1Sample) -> str:
         f"{letter}. {option}"
         for letter, option in zip(("A", "B", "C", "D"), stripped_options, strict=True)
     )
+    evidence = "video frames" if visual_only else "video and its audio"
     return (
-        f"{sample.question.strip()}\n{options}\n"
-        "Use the video and its audio. Reply on the last line as Answer: $LETTER."
+        f"{sample.question.strip()}\n{options}\nUse the {evidence}. "
+        "Reply on the last line as Answer: X, where X is A, B, C, or D."
     )
 
 
-def build_when_prompt(sample: SocialOmniLevel2Sample) -> str:
+def build_when_prompt(
+    sample: SocialOmniLevel2Sample, *, visual_only: bool = False
+) -> str:
     question = sample.question_when.strip() or (
         "Should the target participant begin a substantive turn now?"
     )
+    evidence = "video-frame prefix" if visual_only else "audio-video prefix"
     return (
         f"Target participant: {sample.target_participant}\n"
         f"{question}\nA. YES\nB. NO\n"
-        "Use only the provided audio-video prefix. Reply exactly as Answer: A or Answer: B."
+        f"Use only the provided {evidence}. Reply exactly as Answer: A or Answer: B."
     )
 
 
-def build_response_prompt(sample: SocialOmniLevel2Sample) -> str:
+def build_response_prompt(
+    sample: SocialOmniLevel2Sample, *, visual_only: bool = False
+) -> str:
     question = sample.question_how.strip() or (
         "What should the target participant say next?"
     )
+    evidence = "video-frame prefix" if visual_only else "audio-video prefix"
     return (
         f"Target participant: {sample.target_participant}\n{question}\n"
-        "Use only the provided audio-video prefix. Return only the participant's next utterance."
+        f"Use only the provided {evidence}. Return only the participant's next utterance."
     )
 
 
@@ -391,18 +527,166 @@ def build_judge_prompt(sample: SocialOmniLevel2Sample, candidate: str) -> str:
 
 
 def model_payload(
-    model: str, prompt: str, video_path: str, *, max_tokens: int
+    model: str,
+    prompt: str,
+    video_path: str,
+    *,
+    max_tokens: int,
+    use_audio_in_video: bool = True,
+    frame_data_uris: Sequence[str] = (),
 ) -> dict[str, Any]:
+    if frame_data_uris:
+        content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+        content.extend(
+            {"type": "image_url", "image_url": {"url": uri}} for uri in frame_data_uris
+        )
+        return {
+            "model": model,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": max_tokens,
+            "temperature": 0.0,
+            "stream": False,
+        }
     return {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "videos": [video_path],
-        "use_audio_in_video": True,
+        "use_audio_in_video": use_audio_in_video,
         "modalities": ["text"],
         "max_tokens": max_tokens,
         "temperature": 0.0,
         "stream": False,
     }
+
+
+async def extract_inline_video_frames(
+    video_path: str | Path,
+    *,
+    interval_s: float,
+    max_count: int | None,
+    width: int,
+    height: int,
+    jpeg_quality: int,
+) -> tuple[str, ...]:
+    """Extract paper-compatible visual-only frames as JPEG data URIs."""
+
+    source = Path(video_path).resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"video not found: {source}")
+    ffmpeg = resolve_ffmpeg_executable()
+    command = [
+        ffmpeg,
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(source),
+        "-an",
+        "-vf",
+        f"fps=1/{interval_s:.9g},scale={width}:{height}",
+        "-pix_fmt",
+        "rgb24",
+    ]
+    if max_count is not None:
+        command.extend(["-frames:v", str(max_count)])
+    command.extend(["-f", "rawvideo", "pipe:1"])
+    process = await asyncio.create_subprocess_exec(
+        *command,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout, stderr = await process.communicate()
+    if process.returncode != 0:
+        detail = stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"ffmpeg frame extraction failed: {detail}")
+    frame_size = width * height * 3
+    if not stdout or len(stdout) % frame_size:
+        raise RuntimeError(
+            f"ffmpeg returned invalid raw frame bytes: {len(stdout)} for {frame_size}"
+        )
+
+    frames: list[str] = []
+    for offset in range(0, len(stdout), frame_size):
+        image = Image.frombytes(
+            "RGB", (width, height), stdout[offset : offset + frame_size]
+        )
+        encoded = io.BytesIO()
+        image.save(encoded, format="JPEG", quality=jpeg_quality)
+        payload = base64.b64encode(encoded.getvalue()).decode("ascii")
+        frames.append(f"data:image/jpeg;base64,{payload}")
+    if not frames:
+        raise RuntimeError(f"no frames extracted from {source}")
+    return tuple(frames)
+
+
+async def prepare_model_payload(
+    spec: ModelSpec,
+    prompt: str,
+    video_path: str,
+    *,
+    max_tokens: int,
+) -> dict[str, Any]:
+    if spec.video_input == "inline-frames":
+        frames = await extract_inline_video_frames(
+            video_path,
+            interval_s=spec.frame_interval_s,
+            max_count=spec.frame_max_count,
+            width=spec.frame_width,
+            height=spec.frame_height,
+            jpeg_quality=spec.frame_jpeg_quality,
+        )
+        return model_payload(
+            spec.model,
+            prompt,
+            video_path,
+            max_tokens=max_tokens,
+            frame_data_uris=frames,
+        )
+    return model_payload(
+        spec.model,
+        prompt,
+        video_path,
+        max_tokens=max_tokens,
+        use_audio_in_video=spec.use_audio_in_video,
+    )
+
+
+async def request_model_completion(
+    session: aiohttp.ClientSession,
+    *,
+    spec: ModelSpec,
+    prompt: str,
+    video_path: str,
+    max_tokens: int,
+    request_id: str,
+    phase: str,
+    max_attempts: int,
+    attempt_hook: AttemptHook | None = None,
+) -> ChatResult:
+    if spec.video_input == "upload-av":
+        return await request_upload_av_completion(
+            session,
+            api_url=spec.api_url,
+            video_path=video_path,
+            prompt=prompt,
+            request_id=request_id,
+            phase=phase,
+            max_attempts=max_attempts,
+            attempt_hook=attempt_hook,
+        )
+    payload = await prepare_model_payload(
+        spec, prompt, video_path, max_tokens=max_tokens
+    )
+    return await request_chat_completion(
+        session,
+        api_url=spec.api_url,
+        payload=payload,
+        request_id=request_id,
+        phase=phase,
+        api_key_env=spec.api_key_env,
+        max_attempts=max_attempts,
+        attempt_hook=attempt_hook,
+    )
 
 
 def judge_payload(
@@ -574,8 +858,7 @@ async def bounded_map(
 async def run_level1_model_phase(
     samples: Sequence[SocialOmniLevel1Sample],
     *,
-    base_url: str,
-    model: str,
+    model_spec: ModelSpec,
     max_tokens: int,
     max_concurrency: int,
     max_attempts: int,
@@ -587,15 +870,14 @@ async def run_level1_model_phase(
     async with _client_session(timeout) as session:
 
         async def run_one(sample: SocialOmniLevel1Sample) -> dict[str, Any]:
-            result = await request_chat_completion(
+            result = await request_model_completion(
                 session,
-                api_url=chat_completions_url(base_url),
-                payload=model_payload(
-                    model,
-                    build_level1_prompt(sample),
-                    sample.video_path,
-                    max_tokens=max_tokens,
+                spec=model_spec,
+                prompt=build_level1_prompt(
+                    sample, visual_only=model_spec.video_input == "inline-frames"
                 ),
+                video_path=sample.video_path,
+                max_tokens=max_tokens,
                 request_id=f"{sample.sample_id}:level1",
                 phase="level1",
                 max_attempts=max_attempts,
@@ -632,8 +914,7 @@ async def run_level1_model_phase(
 async def run_level2_model_phase(
     samples: Sequence[SocialOmniLevel2Sample],
     *,
-    base_url: str,
-    model: str,
+    model_spec: ModelSpec,
     prefix_cache_dir: str | Path,
     when_max_tokens: int,
     response_max_tokens: int,
@@ -651,15 +932,14 @@ async def run_level2_model_phase(
             prefix = await create_video_prefix(
                 sample.video_path, sample.timestamp_s, prefix_cache_dir
             )
-            when_result = await request_chat_completion(
+            when_result = await request_model_completion(
                 session,
-                api_url=chat_completions_url(base_url),
-                payload=model_payload(
-                    model,
-                    build_when_prompt(sample),
-                    str(prefix),
-                    max_tokens=when_max_tokens,
+                spec=model_spec,
+                prompt=build_when_prompt(
+                    sample, visual_only=model_spec.video_input == "inline-frames"
                 ),
+                video_path=str(prefix),
+                max_tokens=when_max_tokens,
                 request_id=f"{sample.sample_id}:when",
                 phase="level2_when",
                 max_attempts=max_attempts,
@@ -668,15 +948,14 @@ async def run_level2_model_phase(
             predicted = parse_when(when_result.text) if when_result.is_success else ""
             response_result: ChatResult | None = None
             if sample.gold_when == "YES":
-                response_result = await request_chat_completion(
+                response_result = await request_model_completion(
                     session,
-                    api_url=chat_completions_url(base_url),
-                    payload=model_payload(
-                        model,
-                        build_response_prompt(sample),
-                        str(prefix),
-                        max_tokens=response_max_tokens,
+                    spec=model_spec,
+                    prompt=build_response_prompt(
+                        sample, visual_only=model_spec.video_input == "inline-frames"
                     ),
+                    video_path=str(prefix),
+                    max_tokens=response_max_tokens,
                     request_id=f"{sample.sample_id}:gold_response",
                     phase="level2_gold_response",
                     max_attempts=max_attempts,
