@@ -105,7 +105,7 @@ async def run_socialomni(config: SocialOmniEvalConfig) -> dict[str, Any]:
         model_id=config.model,
         model_revision=None,
         dataset_id=SOCIALOMNI_DATASET_ID,
-        dataset_revision=None,
+        dataset_revision=SOCIALOMNI_DATASET_REVISION,
         launch_command=None,
         server_config={
             "base_url": config.base_url,

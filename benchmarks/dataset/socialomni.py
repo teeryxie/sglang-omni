@@ -95,6 +95,7 @@ def inspect_socialomni_dataset(
     ).hexdigest()
     return {
         "expected_huggingface_revision": SOCIALOMNI_DATASET_REVISION,
+        "verification_scope": "metadata_only",
         "metadata_sha256": observed,
         "evaluation_input_sha256": evaluation_input_sha256,
         "metadata_matches_expected_revision": all(

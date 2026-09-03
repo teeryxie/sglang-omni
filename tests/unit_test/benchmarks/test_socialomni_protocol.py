@@ -548,14 +548,77 @@ async def test_formal_status_requires_clean_repository_and_expected_metadata(
             "metadata_matches_expected_revision": metadata_matches,
         },
     )
-    monkeypatch.setattr(
-        entrypoint,
-        "collect_benchmark_provenance",
-        lambda **_kwargs: {"repository": {"commit": "abc", "dirty": dirty}},
-    )
+
+    def fake_provenance(**kwargs):
+        assert kwargs["dataset_revision"] == entrypoint.SOCIALOMNI_DATASET_REVISION
+        return {"repository": {"commit": "abc", "dirty": dirty}}
+
+    monkeypatch.setattr(entrypoint, "collect_benchmark_provenance", fake_provenance)
     result = await entrypoint.run_socialomni(_config(mini=mini))
     assert result["summary"]["status"] == "complete"
     assert result["summary"]["formal_status"] == expected
+
+
+@pytest.mark.asyncio
+async def test_level2_formal_status_requires_full_three_judge_run(monkeypatch) -> None:
+    samples = [_level2(index) for index in range(209)]
+    records = [
+        {
+            "sample_id": sample.sample_id,
+            "gold_when": "YES",
+            "predicted_when": "YES",
+            "when_success": True,
+            "when_raw_response": "Answer: A",
+            "gold_response": "candidate",
+            "gold_response_success": True,
+            "gold_judge_scores": {},
+            "judge_results": {},
+        }
+        for sample in samples
+    ]
+    judges = [
+        JudgeSpec(name, name, "http://localhost:8000", None, 1)
+        for name in ("gpt-4o", "gemini-2.5-pro", "qwen3-omni")
+    ]
+
+    monkeypatch.setattr(
+        entrypoint, "load_socialomni_level2_samples", lambda *_a, **_k: samples
+    )
+    monkeypatch.setattr(entrypoint, "load_judge_config", lambda _path: judges)
+    monkeypatch.setattr(
+        entrypoint,
+        "inspect_socialomni_dataset",
+        lambda *_a, **_k: {
+            "expected_huggingface_revision": "revision",
+            "verification_scope": "metadata_only",
+            "metadata_sha256": {},
+            "evaluation_input_sha256": "digest",
+            "metadata_matches_expected_revision": True,
+        },
+    )
+    monkeypatch.setattr(
+        entrypoint,
+        "collect_benchmark_provenance",
+        lambda **_kwargs: {"repository": {"commit": "abc", "dirty": False}},
+    )
+
+    async def fake_model(*_args, **_kwargs):
+        return records, []
+
+    async def fake_judges(_samples, current, _judges, **_kwargs):
+        for record in current:
+            record["gold_judge_scores"] = {judge.name: 75 for judge in judges}
+        return [], []
+
+    monkeypatch.setattr(entrypoint, "run_level2_model", fake_model)
+    monkeypatch.setattr(entrypoint, "run_judges", fake_judges)
+
+    result = await entrypoint.run_socialomni(
+        _config(level="level2", judge_config="judges.json")
+    )
+
+    assert result["summary"]["status"] == "complete"
+    assert result["summary"]["formal_status"] == "complete"
 
 
 def test_paper_core_judge_completeness_is_independent() -> None:

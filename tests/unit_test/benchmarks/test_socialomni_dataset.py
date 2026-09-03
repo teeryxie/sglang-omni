@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmarks.dataset import socialomni
+from benchmarks.dataset import prepare, socialomni
 from benchmarks.dataset.socialomni import (
     inspect_socialomni_dataset,
     load_socialomni_level1_samples,
@@ -109,7 +109,31 @@ def test_inspect_dataset_matches_expected_metadata_hashes(
     identity = inspect_socialomni_dataset(tmp_path, ("level1", "level2"))
 
     assert identity["metadata_sha256"] == expected
+    assert identity["verification_scope"] == "metadata_only"
     assert identity["metadata_matches_expected_revision"] is True
+
+
+def test_prepare_downloads_pinned_public_snapshot(tmp_path: Path, monkeypatch) -> None:
+    observed = {}
+
+    def fake_snapshot_download(**kwargs) -> None:
+        observed.update(kwargs)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", fake_snapshot_download)
+
+    prepare.download_dataset(
+        socialomni.SOCIALOMNI_DATASET_ID,
+        local_dir=str(tmp_path),
+        quiet=True,
+    )
+
+    assert observed == {
+        "repo_id": socialomni.SOCIALOMNI_DATASET_ID,
+        "repo_type": "dataset",
+        "local_dir": str(tmp_path),
+        "allow_patterns": ["README.md", "data/level_1/**", "data/level_2/**"],
+        "revision": socialomni.SOCIALOMNI_DATASET_REVISION,
+    }
 
 
 def test_inspect_dataset_rejects_modified_metadata_as_expected_revision(
