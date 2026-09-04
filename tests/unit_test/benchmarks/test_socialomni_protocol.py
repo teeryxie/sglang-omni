@@ -98,7 +98,7 @@ def test_judge_payload_allows_reasoning_before_score() -> None:
     judge = JudgeSpec(
         "gemini-2.5-pro", "gemini-2.5-pro", "http://localhost:8000", None, 1
     )
-    assert judge_payload(judge, "prompt")["max_tokens"] == JUDGE_MAX_TOKENS == 4096
+    assert judge_payload(judge, "prompt")["max_tokens"] == JUDGE_MAX_TOKENS == 8192
 
 
 @pytest.mark.parametrize(

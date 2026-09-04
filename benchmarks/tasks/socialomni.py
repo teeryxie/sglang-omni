@@ -35,7 +35,8 @@ PREFIX_ENCODING = {
     "audio_codec": "aac",
     "audio_bitrate": "192k",
 }
-JUDGE_MAX_TOKENS = 4096
+# Reasoning-capable judges may consume hidden tokens before emitting the score.
+JUDGE_MAX_TOKENS = 8192
 JUDGE_PARSE_ATTEMPTS = 3
 LEVEL1_MAX_TOKENS = 32
 LEVEL2_WHEN_MAX_TOKENS = 8
